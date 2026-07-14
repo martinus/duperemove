@@ -65,6 +65,7 @@
 
 struct exclude_file {
 	char *pattern;
+	bool is_glob;	/* pattern has fnmatch metacharacters */
 	SLIST_ENTRY(exclude_file) list;
 };
 
@@ -296,7 +297,15 @@ static int is_excluded(const char *name)
 	struct exclude_file *exclude;
 
 	SLIST_FOREACH(exclude, &exclude_head, list) {
-		if (fnmatch(exclude->pattern, name, 0) == 0) {
+		/*
+		 * Patterns without metacharacters (e.g. the hashfile paths we
+		 * always exclude) match exactly, so skip fnmatch's much more
+		 * expensive char-by-char loop - this runs for every file.
+		 */
+		bool match = exclude->is_glob ?
+			(fnmatch(exclude->pattern, name, 0) == 0) :
+			(strcmp(exclude->pattern, name) == 0);
+		if (match) {
 			vprintf("Excluding: %s (matches %s)\n", name,
 				exclude->pattern);
 			return 1;
@@ -1411,6 +1420,8 @@ int add_exclude_pattern(const char *pattern)
 		sprintf(exp_pattern, "%s/%s", cwd, pattern);
 		exclude->pattern = strdup(exp_pattern);
 	}
+
+	exclude->is_glob = strpbrk(exclude->pattern, "*?[\\") != NULL;
 
 	vprintf("Adding exclude pattern: %s\n", exclude->pattern);
 
