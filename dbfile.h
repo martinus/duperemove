@@ -185,4 +185,7 @@ int dbfile_remove_hashes(struct dbhandle *db, int64_t fileid);
 
 unsigned int get_max_dedupe_seq(struct dbhandle *db);
 int dbfile_prune_unscanned_files(struct dbhandle *db);
+
+/* Build the find-dupes-phase indexes (deferred past the scan). See dbfile.c. */
+int dbfile_create_search_indexes(struct dbhandle *db);
 #endif	/* __DBFILE_H__ */

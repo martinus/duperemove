@@ -580,6 +580,13 @@ static void process_duplicates(struct dbhandle *db)
 {
 	unsigned int max = get_max_dedupe_seq(db);
 
+	/*
+	 * Ensure the find-dupes indexes exist. Normally built at the end of the
+	 * scan; this covers read-only runs (no scan this invocation) and older
+	 * hashfiles.
+	 */
+	dbfile_create_search_indexes(db);
+
 	/* Spawn a dedicated thread pool to block-based lookup */
 	if (options.do_block_hash)
 		extents_search_init();
@@ -626,6 +633,14 @@ static int scan_files(int argc, char **argv, int filelist_idx, struct dbhandle *
 	if (!quiet)
 		pscan_join();
 
+	if (ret)
+		return ret;
+
+	/*
+	 * The bulk insert is done; build the find-dupes indexes now (deferred
+	 * from open so scanning does not maintain them per row).
+	 */
+	ret = dbfile_create_search_indexes(db);
 	if (ret)
 		return ret;
 

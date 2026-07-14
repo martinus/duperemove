@@ -193,33 +193,44 @@ static int create_indexes(sqlite3 *db)
 	if (ret)
 		goto out;
 
-#define CREATE_BLOCKS_DIGEST_INDEX					\
-"create index if not exists idx_blocks_digest on blocks(digest);"
-	ret = sqlite3_exec(db, CREATE_BLOCKS_DIGEST_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-#define CREATE_EXTENTS_DIGEST_LEN_INDEX					\
-"create index if not exists idx_extents_digest_len on extents(digest, len);"
-	ret = sqlite3_exec(db, CREATE_EXTENTS_DIGEST_LEN_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
+	/*
+	 * dedupe_seq is low-cardinality and consulted before/around scanning, so
+	 * keep it maintained from the start. The digest indexes, by contrast, are
+	 * only used by the find-dupes phase - they are built after the scan, see
+	 * dbfile_create_search_indexes().
+	 */
 #define CREATE_FILES_DEDUPESEQ_INDEX					\
 "create index if not exists idx_files_dedupeseq on files(dedupe_seq);"
 	ret = sqlite3_exec(db, CREATE_FILES_DEDUPESEQ_INDEX, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
-#define CREATE_FILES_DIGEST_SIZE_INDEX					\
-"create index if not exists idx_files_digest_size on files(digest, size);"
-	ret = sqlite3_exec(db, CREATE_FILES_DIGEST_SIZE_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
 out:
 	if (ret)
 		perror_sqlite(ret, "creating database index");
+	return ret;
+}
+
+/*
+ * Indexes used only by the find-dupes phase, not while scanning. They are
+ * created after the scan's bulk insert rather than at open, so the first scan
+ * of a fresh hashfile does not pay to maintain them on every insert - random
+ * digest keys are the worst case for incremental B-tree maintenance, and a
+ * one-shot build sorts once instead. Once built they persist in the hashfile,
+ * so later incremental scans keep them up to date cheaply and the "if not
+ * exists" below is a no-op.
+ */
+int dbfile_create_search_indexes(struct dbhandle *db)
+{
+	int ret;
+
+#define CREATE_SEARCH_INDEXES						\
+"create index if not exists idx_blocks_digest on blocks(digest);"	\
+"create index if not exists idx_extents_digest_len on extents(digest, len);" \
+"create index if not exists idx_files_digest_size on files(digest, size);"
+	ret = sqlite3_exec(db->db, CREATE_SEARCH_INDEXES, NULL, NULL, NULL);
+	if (ret)
+		perror_sqlite(ret, "creating search indexes");
 	return ret;
 }
 
