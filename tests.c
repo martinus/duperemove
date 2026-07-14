@@ -122,11 +122,50 @@ MU_TEST(test_seen_inode) {
 	seen_inodes = NULL;
 }
 
+MU_TEST(test_get_extent) {
+	/* Three data extents with holes between them:
+	 * [0, 4k)   hole   [8k, 12k)   hole   [16k, 20k) */
+	unsigned int n = 3;
+	struct fiemap *fm = calloc(1, sizeof(*fm) +
+				   n * sizeof(struct fiemap_extent));
+
+	fm->fm_mapped_extents = n;
+	fm->fm_extents[0].fe_logical = 0;     fm->fm_extents[0].fe_length = 4096;
+	fm->fm_extents[1].fe_logical = 8192;  fm->fm_extents[1].fe_length = 4096;
+	fm->fm_extents[2].fe_logical = 16384; fm->fm_extents[2].fe_length = 4096;
+
+	/* Plain lookups (no cursor). */
+	mu_check(get_extent(fm, 0, NULL) == &fm->fm_extents[0]);
+	mu_check(get_extent(fm, 4095, NULL) == &fm->fm_extents[0]);
+	mu_check(get_extent(fm, 4096, NULL) == &fm->fm_extents[1]); /* in hole -> next */
+	mu_check(get_extent(fm, 8192, NULL) == &fm->fm_extents[1]);
+	mu_check(get_extent(fm, 16384, NULL) == &fm->fm_extents[2]);
+	mu_check(get_extent(fm, 20480, NULL) == NULL);             /* past EOF */
+
+	/* A resume cursor must give identical answers for a monotonically
+	 * increasing sequence of offsets (the scan access pattern). */
+	unsigned int cur = 0;
+	size_t offs[] = { 0, 4095, 4096, 8192, 12000, 16384, 19000 };
+	for (unsigned int i = 0; i < ARRAY_SIZE(offs); i++)
+		mu_check(get_extent(fm, offs[i], &cur) ==
+			 get_extent(fm, offs[i], NULL));
+
+	/* A stale cursor pointing past the target must still be correct
+	 * (get_extent falls back to a full scan). */
+	cur = 2;
+	mu_check(get_extent(fm, 0, &cur) == &fm->fm_extents[0]);
+	cur = 2;
+	mu_check(get_extent(fm, 8192, &cur) == &fm->fm_extents[1]);
+
+	free(fm);
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
 	MU_RUN_TEST(test_is_file_renamed);
 	MU_RUN_TEST(test_seen_inode);
+	MU_RUN_TEST(test_get_extent);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {
