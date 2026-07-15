@@ -96,10 +96,13 @@ static struct threads_pool scan_pool;
  * scan_write_{begin,end,abort}() must be called with the write lock held.
  * scan_writer_{open,close}() bracket the scan while no worker is running.
  */
-#define WRITE_BATCH_FILES	1000
+#define COMMIT_INTERVAL_SEC	10.0
 static struct dbhandle *scan_writer;
 static bool scan_trans_open;
-static unsigned int scan_trans_pending;
+static double scan_write_start;
+static struct dbhandle *scan_read_db;	/* listing handle whose reads we batch */
+static bool scan_read_open;
+static double scan_read_start;
 
 static int scan_writer_open(void)
 {
@@ -120,7 +123,7 @@ static int scan_write_begin(void)
 		return ret;
 
 	scan_trans_open = true;
-	scan_trans_pending = 0;
+	scan_write_start = elapsed_seconds();
 	return 0;
 }
 
@@ -134,14 +137,13 @@ static int scan_write_flush(void)
 
 	ret = dbfile_commit_trans(scan_writer->db);
 	scan_trans_open = false;
-	scan_trans_pending = 0;
 	return ret;
 }
 
-/* Count one written file, committing the batch once it is full. */
+/* Commit the write batch once it has been open COMMIT_INTERVAL_SEC. */
 static int scan_write_end(void)
 {
-	if (scan_trans_open && ++scan_trans_pending >= WRITE_BATCH_FILES)
+	if (scan_trans_open && elapsed_seconds() - scan_write_start >= COMMIT_INTERVAL_SEC)
 		return scan_write_flush();
 	return 0;
 }
@@ -154,7 +156,33 @@ static void scan_write_abort(void)
 
 	dbfile_abort_trans(scan_writer->db);
 	scan_trans_open = false;
-	scan_trans_pending = 0;
+}
+
+/* Commit the listing read transaction if one is open. */
+static void scan_read_flush(void)
+{
+	if (scan_read_open) {
+		dbfile_commit_trans(scan_read_db->db);
+		scan_read_open = false;
+	}
+}
+
+/*
+ * Keep one read transaction open across the per-file change-detection lookups,
+ * refreshed on the COMMIT_INTERVAL_SEC cadence so the reader snapshot doesn't
+ * pin the WAL against checkpointing. Listing thread only, so no locking.
+ */
+static void scan_read_tick(struct dbhandle *db)
+{
+	double now = elapsed_seconds();
+
+	scan_read_db = db;
+	if (scan_read_open && now - scan_read_start >= COMMIT_INTERVAL_SEC)
+		scan_read_flush();
+	if (!scan_read_open && dbfile_begin_trans(db->db) == 0) {
+		scan_read_open = true;
+		scan_read_start = now;
+	}
 }
 
 /* Flush and drop the writer. Call while no worker thread is running. */
@@ -766,6 +794,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	abort_on(!S_ISREG(st->stx_mode));
 
 	pscan_examined();	/* count every file the listing walk visits */
+	scan_read_tick(db);
 
 	if (locked_fs.is_btrfs && !subvol_cache_get(stx_to_dev(st), &dbfile.subvol)) {
 		_cleanup_(closefd) int fd;
@@ -1508,7 +1537,8 @@ void filescan_init(void)
 void filescan_free(void)
 {
 	free_pool(&scan_pool);
-	/* All workers have joined: flush and drop the scan writer. */
+	/* All workers have joined: flush the batched reads and drop the writer. */
+	scan_read_flush();
 	scan_writer_close();
 	subvol_cache_free();
 	if (seen_inodes) {
