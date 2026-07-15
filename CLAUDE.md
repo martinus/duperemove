@@ -63,6 +63,27 @@ Startup/scan cost has burned us before. The rules:
   guards this; a batch that aborts here can silently empty the hashfile while
   exiting 0. There's a regression test — keep it.
 
+## Scan parallelism (the walk)
+
+The directory walk (`opendir`/`readdir`/`statx`) runs on N walker threads
+(`--io-threads`); every regular file is handed to a **single consumer** (the
+main thread) that runs `__scan_file()`. That split is deliberate: all the
+delicate per-file state — the batched writer, `dedupe_seq`, `seen_inodes`, the
+batched read transaction, `subvol_cache` — stays on the one consumer and needs
+no locking. Walkers only read `locked_fs` (set on the main thread before they
+spawn) and the mutex-guarded `verified_devs`. **Don't move per-file DB state
+onto the walker threads.**
+
+- **Walker count plateaus at ~8 on btrfs — do not raise the default cap.**
+  Measured on a cold 149k-file `~/git` scan: 1→2→4 threads scaled well
+  (15s→9.9s→7.8s), 8 was the knee (7.3s), and 16/32 gave no wall-clock gain
+  while `sys` time exploded (16s→23s→46s). It's btrfs metadata b-tree lock
+  contention (`btrfs_search_slot` / `_raw_spin_lock`), not I/O latency, so more
+  threads just burn cores. The default cap (8) is right.
+- On a cold walk the cost is fundamental btrfs metadata I/O
+  (`statx → btrfs_iget → btree reads`); SQLite is <2%, so parallelizing the
+  consumer would not help that workload.
+
 ## dedupe_seq (incremental dedup)
 
 Scan assigns `seq = config+1`, bumped every `--batchsize`/`-B` files (default
