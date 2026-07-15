@@ -303,6 +303,21 @@ static int dbfile_set_modes(sqlite3 *db)
 		return ret;
 	}
 
+	/*
+	 * The default (no --hashfile) database is an in-memory shared-cache db
+	 * (see MEMDB_FILENAME) shared by the listing reader, the batched writer
+	 * and the csum workers - all separate connections. Shared-cache does
+	 * table-level locking between connections, so the reader's lock on the
+	 * files table makes the writer's INSERT fail with SQLITE_LOCKED ("table
+	 * is locked"). read_uncommitted lets readers proceed without that lock;
+	 * it only affects shared-cache mode and is a no-op for WAL file dbs.
+	 */
+	ret = sqlite3_exec(db, "PRAGMA read_uncommitted = 1", NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret, "enabling read-uncommitted");
+		return ret;
+	}
+
 	return ret;
 }
 
