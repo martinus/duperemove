@@ -185,9 +185,7 @@ static int disk_extent_grew(struct dupe_extents *dext, struct extent *extent)
 	 * - Kernels before 4.2 rejected unaligned lengths, so we can
 	 *   have a residual tail extent to dedupe.
 	 */
-	if (extent_plen(extent) < dext->de_len)
-		return 1;
-	return 0;
+	return extent_plen(extent) < dext->de_len;
 }
 
 /*
@@ -500,6 +498,13 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 	}
 
 	dbfile_lock();
+	/*
+	 * Wrap all of this group's hashfile updates in a single transaction.
+	 * Otherwise every dbfile_update_extent_poff()/remove is its own implicit
+	 * transaction, forcing a WAL commit per extent - which dominates the
+	 * dedupe phase for groups with many duplicates.
+	 */
+	dbfile_begin_trans(db->db);
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
 		if (whole_file_dedup) {
 			/* If we are deduping a whole file, then the extents may be remapped
@@ -518,6 +523,7 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 				dbfile_update_extent_poff(db, extent->e_file->fileid, extent->e_loff, extent->e_poff);
 		}
 	}
+	dbfile_commit_trans(db->db);
 	dbfile_unlock();
 
 	if (!list_empty(&dext->de_extents)) {

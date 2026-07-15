@@ -66,8 +66,6 @@ static void dbfile_config_defaults(struct dbfile_config *cfg)
 
 	cfg->major = DB_FILE_MAJOR;
 	cfg->minor = DB_FILE_MINOR;
-
-	cfg->blocksize = blocksize;
 }
 
 static int dbfile_get_dbpath(sqlite3 *db, char *path)
@@ -178,51 +176,61 @@ static int create_indexes(sqlite3 *db)
 {
 	int ret;
 
-#define CREATE_BLOCKS_DIGEST_INDEX					\
-"create index if not exists idx_blocks_digest on blocks(digest);"
-	ret = sqlite3_exec(db, CREATE_BLOCKS_DIGEST_INDEX, NULL, NULL, NULL);
+	/*
+	 * Drop indexes that only duplicate the leftmost prefix of a UNIQUE
+	 * constraint's automatic index, so sqlite never picks them: ino_subvol
+	 * duplicates UNIQUE(ino, subvol); extents/blocks fileid duplicate
+	 * UNIQUE(fileid, loff[, len]). They cost space in the hashfile and an
+	 * extra index update on every insert for no query benefit. Drop them so
+	 * hashfiles written by older versions shed them too (space is reclaimed
+	 * on the next vacuum).
+	 */
+#define DROP_REDUNDANT_INDEXES						\
+"drop index if exists idx_files_ino_subvol;"				\
+"drop index if exists idx_extents_fileid;"				\
+"drop index if exists idx_blocks_fileid;"
+	ret = sqlite3_exec(db, DROP_REDUNDANT_INDEXES, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
-#define CREATE_BLOCKS_FILEID_INDEX					\
-"create index if not exists idx_blocks_fileid on blocks(fileid);"
-	ret = sqlite3_exec(db, CREATE_BLOCKS_FILEID_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-#define CREATE_EXTENTS_DIGEST_LEN_INDEX					\
-"create index if not exists idx_extents_digest_len on extents(digest, len);"
-	ret = sqlite3_exec(db, CREATE_EXTENTS_DIGEST_LEN_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-#define CREATE_EXTENTS_FILEID_INDEX					\
-"create index if not exists idx_extents_fileid on extents(fileid);"
-	ret = sqlite3_exec(db, CREATE_EXTENTS_FILEID_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-#define CREATE_FILES_INO_SUBVOL_INDEX					\
-"create index if not exists idx_files_ino_subvol on files(ino, subvol);"
-	ret = sqlite3_exec(db, CREATE_FILES_INO_SUBVOL_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
+	/*
+	 * dedupe_seq is low-cardinality and consulted before/around scanning, so
+	 * keep it maintained from the start. The digest indexes, by contrast, are
+	 * only used by the find-dupes phase - they are built after the scan, see
+	 * dbfile_create_search_indexes().
+	 */
 #define CREATE_FILES_DEDUPESEQ_INDEX					\
 "create index if not exists idx_files_dedupeseq on files(dedupe_seq);"
 	ret = sqlite3_exec(db, CREATE_FILES_DEDUPESEQ_INDEX, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
-#define CREATE_FILES_DIGEST_SIZE_INDEX					\
-"create index if not exists idx_files_digest_size on files(digest, size);"
-	ret = sqlite3_exec(db, CREATE_FILES_DIGEST_SIZE_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
 out:
 	if (ret)
 		perror_sqlite(ret, "creating database index");
+	return ret;
+}
+
+/*
+ * Indexes used only by the find-dupes phase, not while scanning. They are
+ * created after the scan's bulk insert rather than at open, so the first scan
+ * of a fresh hashfile does not pay to maintain them on every insert - random
+ * digest keys are the worst case for incremental B-tree maintenance, and a
+ * one-shot build sorts once instead. Once built they persist in the hashfile,
+ * so later incremental scans keep them up to date cheaply and the "if not
+ * exists" below is a no-op.
+ */
+int dbfile_create_search_indexes(struct dbhandle *db)
+{
+	int ret;
+
+#define CREATE_SEARCH_INDEXES						\
+"create index if not exists idx_blocks_digest on blocks(digest);"	\
+"create index if not exists idx_extents_digest_len on extents(digest, len);" \
+"create index if not exists idx_files_digest_size on files(digest, size);"
+	ret = sqlite3_exec(db->db, CREATE_SEARCH_INDEXES, NULL, NULL, NULL);
+	if (ret)
+		perror_sqlite(ret, "creating search indexes");
 	return ret;
 }
 
@@ -1158,6 +1166,22 @@ int dbfile_load_one_filerec(struct dbhandle *db, int64_t fileid,
 	return 0;
 }
 
+/* Return the cached filerec for fileid, loading it from the db if needed. */
+static int find_or_load_filerec(struct dbhandle *db, int64_t fileid,
+				struct filerec **file)
+{
+	int ret;
+
+	*file = filerec_find(fileid);
+	if (*file)
+		return 0;
+
+	ret = dbfile_load_one_filerec(db, fileid, file);
+	if (ret)
+		eprintf("Error loading filerec (%"PRIu64") from db\n", fileid);
+	return ret;
+}
+
 int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 			     unsigned int seq)
 {
@@ -1179,16 +1203,9 @@ int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 		fileid = sqlite3_column_int64(stmt, 1);
 		loff = sqlite3_column_int64(stmt, 2);
 
-		file = filerec_find(fileid);
-		if (!file) {
-			ret = dbfile_load_one_filerec(db, fileid, &file);
-			if (ret) {
-				eprintf("Error loading filerec (%"
-					PRIu64") from db\n",
-					fileid);
-				return ret;
-			}
-		}
+		ret = find_or_load_filerec(db, fileid, &file);
+		if (ret)
+			return ret;
 
 		ret = insert_hashed_block(hash_tree, digest, file, loff);
 		if (ret)
@@ -1227,16 +1244,9 @@ int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
 		len = sqlite3_column_int64(stmt, 3);
 		poff = sqlite3_column_int64(stmt, 4);
 
-		file = filerec_find(fileid);
-		if (!file) {
-			ret = dbfile_load_one_filerec(db, fileid, &file);
-			if (ret) {
-				eprintf("Error loading filerec (%"
-					PRIu64") from db\n",
-					fileid);
-				return ret;
-			}
-		}
+		ret = find_or_load_filerec(db, fileid, &file);
+		if (ret)
+			return ret;
 
 		ret = insert_one_result(res, digest, file, loff, len, poff);
 		if (ret)
@@ -1292,7 +1302,7 @@ int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 {
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.get_nondupe_extents;
-	uint64_t count = 0, i;
+	uint64_t count = 0, capacity = 0;
 	struct file_extent *extents = NULL;
 
 	ret = sqlite3_bind_int64(stmt, 1, file->fileid);
@@ -1301,21 +1311,25 @@ int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 		goto out;
 	}
 
-	i = 0;
 	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-		count++;
+		if (count == capacity) {
+			struct file_extent *tmp;
 
-		extents = realloc(extents, count * sizeof(struct file_extent));
-		if (!extents) {
-			ret = ENOMEM;
-			goto out;
+			/* Grow geometrically to avoid O(n^2) copying. */
+			capacity = capacity ? capacity * 2 : 16;
+			tmp = realloc(extents, capacity * sizeof(struct file_extent));
+			if (!tmp) {
+				ret = ENOMEM;
+				goto out;
+			}
+			extents = tmp;
 		}
 
-		extents[i].loff = sqlite3_column_int64(stmt, 0);
-		extents[i].len = sqlite3_column_int64(stmt, 1);
-		extents[i].poff = sqlite3_column_int64(stmt, 2);
+		extents[count].loff = sqlite3_column_int64(stmt, 0);
+		extents[count].len = sqlite3_column_int64(stmt, 1);
+		extents[count].poff = sqlite3_column_int64(stmt, 2);
 
-		++i;
+		count++;
 	}
 
 	*num_extents = count;
@@ -1538,8 +1552,13 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 }
 
 /*
- * Remove entries from the files table that have no extents associated.
- * This can happen if duperemove is ctrl^C while scanning files
+ * Remove entries from the files table that were listed but never csummed, i.e.
+ * whose digest is still NULL. This happens when a previous run was interrupted
+ * (e.g. ctrl^C) after inserting a file record but before storing its hashes.
+ *
+ * Note this does NOT remove entries for files deleted from disk: those keep a
+ * valid digest and are simply never revisited by the scan. Use -R to drop
+ * specific paths from the hashfile.
  */
 int dbfile_prune_unscanned_files(struct dbhandle *db)
 {

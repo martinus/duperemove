@@ -3,5 +3,8 @@ duperemove
 btrfs-extent-same
 csum-test
 hashstats
+test
 *~
 *.d
+.itest-scratch/
+__pycache__/
