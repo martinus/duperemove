@@ -45,6 +45,19 @@ class DedupeTest(DuperemoveTest):
         self.assertNoNewSharing()
         self.assertShared(a, b, "still shared after second run")
 
+    def test_in_memory_hashfile_dedupes_without_lock_errors(self):
+        # With no --hashfile duperemove uses an in-memory shared-cache db that
+        # the listing reader, the batched writer and the csum workers all open
+        # as separate connections. Shared-cache does table-level locking between
+        # connections, so without read_uncommitted every write failed with
+        # "Database error 6 ... database table is locked" and nothing was stored.
+        a, b = self.mkdup("tree/a", "tree/b", MiB)
+        self._sync()
+        self.dm("-rd", self.path("tree"), hashfile=False)
+        self.assertDmOk()
+        self._sync()
+        self.assertShared(a, b, "in-memory dedupe shared the pair")
+
     def test_leaves_distinct_files_alone(self):
         a = self.mkrand("tree/a", MiB)
         b = self.mkrand("tree/b", MiB)
