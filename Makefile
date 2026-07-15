@@ -68,6 +68,18 @@ test:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests.c -o $@ $(LIBRARY_FLAGS)
 	./test
 
+# End-to-end tests: drive the built binary against a scratch tree and assert on
+# the hashfile and on-disk sharing (Python stdlib unittest, no extra deps).
+# Needs a reflink-capable scratch fs for the dedupe cases (override with
+# DUPEREMOVE_TEST_DIR=/path on e.g. btrfs/xfs).
+.PHONY: integration
+integration: duperemove
+	DUPEREMOVE=./duperemove python3 tests/run.py
+
+# Everything: unit tests plus the integration suite.
+.PHONY: check
+check: test integration
+
 install: $(install_progs) $(MANPAGES) $(ZSH_COMPLETION)
 	mkdir -p -m 0755 $(DESTDIR)$(BINDIR)
 	for prog in $(install_progs); do \
