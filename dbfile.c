@@ -39,9 +39,44 @@ static GMutex io_mutex; /* Locks db writes */
 		__FUNCTION__, syscall(SYS_gettid), _err, _why, sqlite3_errstr(_err))
 #endif
 
-#define	perror_sqlite_open(_ptr, _filename)				\
-	eprintf("Error opening db \"%s\": %s\n", _filename,	\
-		sqlite3_errmsg(_ptr))
+/*
+ * Explain why a hashfile could not be opened. SQLite collapses most failures
+ * into a generic "unable to open database file"; the usual real cause is that
+ * the parent directory does not exist (SQLite creates the file, not the dir),
+ * so check for that and give an actionable hint.
+ */
+static void report_db_open_error(const char *filename, sqlite3 *db)
+{
+	char dir[PATH_MAX + 1];
+	const char *slash = strrchr(filename, '/');
+	struct stat st;
+
+	if (slash == filename)
+		snprintf(dir, sizeof(dir), "/");
+	else if (slash)
+		snprintf(dir, sizeof(dir), "%.*s", (int)(slash - filename), filename);
+	else
+		snprintf(dir, sizeof(dir), ".");
+
+	if (stat(dir, &st) != 0 && errno == ENOENT) {
+		eprintf("Error: cannot open hashfile \"%s\": directory \"%s\" "
+			"does not exist.\n", filename, dir);
+		if (filename[0] == '~')
+			eprintf("       A leading '~' after --hashfile= is not "
+				"expanded by the shell; use $HOME or a full path.\n");
+		else
+			eprintf("       Create it first, e.g.: mkdir -p \"%s\"\n",
+				dir);
+		return;
+	}
+	if (stat(dir, &st) == 0 && !S_ISDIR(st.st_mode)) {
+		eprintf("Error: cannot open hashfile \"%s\": \"%s\" is not a "
+			"directory.\n", filename, dir);
+		return;
+	}
+	eprintf("Error opening hashfile \"%s\": %s\n", filename,
+		sqlite3_errmsg(db));
+}
 
 struct dbhandle *dbfile_get_handle(void)
 {
@@ -362,7 +397,7 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create)
 	}
 
 	if (ret) {
-		perror_sqlite_open(db, filename);
+		report_db_open_error(filename, db);
 		sqlite3_close(db);
 		return NULL;
 	}
