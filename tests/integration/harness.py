@@ -77,22 +77,29 @@ def fiemap_extents(path):
     """
     fd = os.open(path, os.O_RDONLY)
     try:
-        count = 64
-        while True:
-            buf = bytearray(_FIEMAP_HDR.size + count * _FIEMAP_EXT.size)
-            _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
-                                  _FIEMAP_FLAG_SYNC, 0, count, 0)
-            fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
-            mapped = _FIEMAP_HDR.unpack_from(buf, 0)[3]
-            if mapped > count:            # buffer too small; grow and retry
-                count = mapped
-                continue
-            out = []
-            for i in range(mapped):
-                logical, physical, length, _r0, _r1, flags, *_ = \
-                    _FIEMAP_EXT.unpack_from(buf, _FIEMAP_HDR.size + i * _FIEMAP_EXT.size)
-                out.append((logical, physical, length, flags))
-            return out
+        # extent_count=0 makes the kernel report only the total extent count
+        # (it never fills more than fm_extent_count, so a single sized guess can
+        # silently truncate). Count first, then fetch exactly that many.
+        buf = bytearray(_FIEMAP_HDR.size)
+        _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
+                              _FIEMAP_FLAG_SYNC, 0, 0, 0)
+        fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
+        count = _FIEMAP_HDR.unpack_from(buf, 0)[3]
+        if count == 0:
+            return []
+
+        buf = bytearray(_FIEMAP_HDR.size + count * _FIEMAP_EXT.size)
+        _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
+                              _FIEMAP_FLAG_SYNC, 0, count, 0)
+        fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
+        mapped = _FIEMAP_HDR.unpack_from(buf, 0)[3]
+
+        out = []
+        for i in range(mapped):
+            logical, physical, length, _r0, _r1, flags, *_ = \
+                _FIEMAP_EXT.unpack_from(buf, _FIEMAP_HDR.size + i * _FIEMAP_EXT.size)
+            out.append((logical, physical, length, flags))
+        return out
     finally:
         os.close(fd)
 

@@ -270,6 +270,41 @@ static void clean_deduped(struct dupe_extents **ret_dext)
 	}
 }
 
+/*
+ * Deduping every copy against a fragmented target makes each copy inherit that
+ * fragmentation: one extent-tree op per target extent per copy, and all copies
+ * left fragmented on disk (measured ~linear in target extents once past a fixed
+ * per-copy floor). For whole-file dedupe - where members are whole files whose
+ * layouts can differ - pick the least-fragmented member as the target by moving
+ * it to the front of the list; the loop below always dedupes against the first
+ * entry. Extent-dedupe members are single extents, so this is skipped there.
+ */
+static void pick_least_fragmented_target(struct dupe_extents *dext)
+{
+	struct extent *extent, *best = NULL;
+	unsigned int best_extents = 0;
+
+	list_for_each_entry(extent, &dext->de_extents, e_list) {
+		unsigned int n;
+
+		if (filerec_open(extent->e_file, true))
+			continue;
+		/* Count-only fiemap: we need the extent count, not the map. */
+		n = fiemap_count_extents(extent->e_file->fd, extent->e_loff,
+					 extent_len(extent));
+		filerec_close(extent->e_file);
+
+		/* n == 0 means the fiemap failed; ignore that candidate. */
+		if (n && (best == NULL || n < best_extents)) {
+			best = extent;
+			best_extents = n;
+		}
+	}
+
+	if (best)
+		list_move(&best->e_list, &dext->de_extents);
+}
+
 #define	DEDUPE_EXTENTS_CLEANED	(-1)
 static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 			      uint64_t *kern_bytes, unsigned long long passno)
@@ -317,6 +352,13 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 	 * extents.
 	 */
 	add_shared_extents(dext, &shared_prev);
+
+	/*
+	 * Prefer the least-fragmented copy as the dedupe target so the others
+	 * don't inherit a bad on-disk layout. Only meaningful for whole files.
+	 */
+	if (whole_file_dedup)
+		pick_least_fragmented_target(dext);
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
 		if (list_is_last(&extent->e_list, &dext->de_extents))
