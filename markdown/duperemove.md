@@ -86,7 +86,9 @@ dedupe runs.
     If `hashfile` does not exist it will be created. If it exists,
 `duperemove` will check the file paths stored inside of it for changes.
 Files which have changed will be rescanned and their updated hashes will be
-written to the `hashfile`. Deleted files will be removed from the `hashfile`.
+written to the `hashfile`. Entries for files that were deleted from disk are
+not pruned automatically; use `-R` to remove specific paths from the
+`hashfile`.
 
     New files are only added to the `hashfile` if they are discoverable via
 the `files` argument. For that reason you probably want to provide the

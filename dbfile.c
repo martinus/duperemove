@@ -1552,8 +1552,13 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 }
 
 /*
- * Remove entries from the files table that have no extents associated.
- * This can happen if duperemove is ctrl^C while scanning files
+ * Remove entries from the files table that were listed but never csummed, i.e.
+ * whose digest is still NULL. This happens when a previous run was interrupted
+ * (e.g. ctrl^C) after inserting a file record but before storing its hashes.
+ *
+ * Note this does NOT remove entries for files deleted from disk: those keep a
+ * valid digest and are simply never revisited by the scan. Use -R to drop
+ * specific paths from the hashfile.
  */
 int dbfile_prune_unscanned_files(struct dbhandle *db)
 {

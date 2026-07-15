@@ -40,8 +40,9 @@ class IncrementalTest(DuperemoveTest):
     def test_rescan_retains_deleted_file_row(self):
         # duperemove's prune only removes NULL-digest rows (interrupted-scan
         # leftovers); a file deleted from disk keeps its digest and is simply
-        # never revisited, so its row survives. This characterizes the current
-        # behavior (same on master) so a change in either direction is noticed.
+        # never revisited, so its row survives (use -R to drop it). This matches
+        # the documented behavior and upstream; the test pins it so a change in
+        # either direction is noticed.
         self.mkrand("tree/a", 10000)
         self.mkrand("tree/b", 10000)
         self.scan(self.path("tree"))
