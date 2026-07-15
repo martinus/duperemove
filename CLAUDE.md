@@ -28,6 +28,10 @@ the repo — don't commit it.
 
 Startup/scan cost has burned us before. The rules:
 
+- **`scripts/perf-profile.sh`** wraps all of this: it runs a duperemove command
+  under `perf` and prints the self/leaf view, the caller/stack view, `perf stat`,
+  and a syscall summary. E.g.
+  `scripts/perf-profile.sh --cold -- -dr --hashfile=/tmp/prof.db ~/git`.
 - **Never draw conclusions from `strace -c`.** Its per-syscall interception
   overhead inflates whatever is called most often. It once reported `statx` at
   66% (it's really ~7%) and completely hid the actual hotspot, which was
