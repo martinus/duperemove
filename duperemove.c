@@ -52,6 +52,7 @@ unsigned int blocksize = DEFAULT_BLOCKSIZE;
 static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
+static int opt_no_color = 0;
 struct dbfile_config dbfile_cfg;
 
 static enum {
@@ -204,6 +205,7 @@ enum {
 	QUIET_OPTION,
 	EXCLUDE_OPTION,
 	BATCH_SIZE_OPTION,
+	NO_COLOR_OPTION,
 };
 
 static int process_fdupes(void)
@@ -316,6 +318,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "quiet", 0, NULL, QUIET_OPTION },
 		{ "exclude", 1, NULL, EXCLUDE_OPTION },
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
+		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -402,6 +405,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case QUIET_OPTION:
 		case 'q':
 			quiet = 1;
+			break;
+		case NO_COLOR_OPTION:
+			opt_no_color = 1;
 			break;
 		case EXCLUDE_OPTION:
 			if (add_exclude_pattern(optarg))
@@ -520,7 +526,7 @@ static void print_header(void)
 #ifdef	DEBUG_BUILD
 	printf("Debug build, performance may be impacted.\n");
 #endif
-	qprintf("Gathering file list...\n");
+	qprintf("%s%sScanning%s files...\n", col_bold, col_cyan, col_reset);
 }
 
 static void __process_duplicates(struct dbhandle *db, unsigned int seq)
@@ -532,7 +538,7 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 	init_results_tree(&res);
 	init_hash_tree(&dups_tree);
 
-	qprintf("Loading only identical files from hashfile.\n");
+	vprintf("Loading identical files...\n");
 	ret = dbfile_load_same_files(db, &res, seq + 1);
 	if (ret)
 		goto out;
@@ -548,13 +554,13 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 	if (!options.only_whole_files) {
 		init_results_tree(&res);
 
-		qprintf("Loading only duplicated hashes from hashfile.\n");
+		vprintf("Loading duplicated hashes...\n");
 
 		ret = dbfile_load_extent_hashes(db, &res, seq + 1);
 		if (ret)
 			goto out;
 
-		printf("Found %llu identical extents.\n", res.num_extents);
+		vprintf("Found %llu identical extents\n", res.num_extents);
 		if (options.do_block_hash) {
 			ret = dbfile_load_block_hashes(db, &dups_tree, seq + 1);
 			if (ret)
@@ -593,6 +599,19 @@ static void process_duplicates(struct dbhandle *db)
 	if (options.do_block_hash)
 		extents_search_init();
 
+	/* One status line + one summary spanning every pass below. Estimate the
+	 * total dup-group count first so the progress bar and ETA have a scale. */
+	if (options.run_dedupe) {
+		unsigned long long total;
+
+		if (!quiet && isatty(STDOUT_FILENO)) {
+			printf("  %sAnalyzing duplicates...%s\r", col_dim, col_reset);
+			fflush(stdout);
+		}
+		total = dbfile_count_dupe_groups(db, options.only_whole_files);
+		dedupe_begin(total);
+	}
+
 	for (unsigned int i = dedupe_seq; i < max; i++) {
 		/* Drop all filerecs from the previous iteration. Needed filerecs will be
 		 * recreated by __process_duplicates()
@@ -611,6 +630,9 @@ static void process_duplicates(struct dbhandle *db)
 			dbfile_sync_config(db, &dbfile_cfg);
 		}
 	}
+
+	if (options.run_dedupe)
+		dedupe_end();
 
 	if (options.do_block_hash)
 		extents_search_free();
@@ -674,6 +696,9 @@ int main(int argc, char **argv)
 	if (ret) {
 		exit(1);
 	}
+
+	color_init(opt_no_color);
+	start_timer();
 
 	/* Allow larger than unusal amount of open files. On linux
 	 * this should bw increase form 1K to 512K open files

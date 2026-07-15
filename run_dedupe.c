@@ -51,6 +51,11 @@ static volatile unsigned long long curr_dedupe_pass;
 static unsigned int leading_spaces;
 static bool whole_file_dedup;
 
+/* Cross-pass dedupe stats, accumulated across every dedupe_results() call. */
+static volatile unsigned long long dedupe_groups_done;
+static uint64_t dedupe_total_bytes;
+static uint64_t dedupe_total_kern;
+
 void print_dupes_table(struct results_tree *res, bool whole_file)
 {
 	struct rb_root *root = &res->root;
@@ -284,8 +289,9 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 
 	abort_on(dext->de_num_dupes < 2);
 
-	/* Dedupe extents with id %s*/
-	if (!quiet) {
+	/* Per-group detail is noisy on large runs; show it only with -v. The
+	 * default view is the live progress bar started in dedupe_results(). */
+	if (verbose) {
 		g_mutex_lock(&console_mutex);
 		printf("[%p] (%0*llu/%llu) Try to dedupe extents with id ",
 		       g_thread_self(), leading_spaces, passno,
@@ -304,7 +310,7 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 	 */
 	clean_deduped(&dext);
 	if (!dext) {
-		qprintf("[%p] Skipping - extents are already deduped.\n",
+		vprintf("[%p] Skipping - extents are already deduped.\n",
 		       g_thread_self());
 		return DEDUPE_EXTENTS_CLEANED;
 	}
@@ -402,7 +408,7 @@ run_dedupe:
 		 * case but always do cleanup.
 		 */
 		if (ctxt->num_queued) {
-			if (!quiet) {
+			if (verbose) {
 				g_mutex_lock(&console_mutex);
 				printf("[%p] Dedupe %u extents (id: ",
 				       g_thread_self(), ctxt->num_queued);
@@ -545,6 +551,7 @@ static void dedupe_worker(void *priv, struct dedupe_counts *counts)
 	g_mutex_lock(&dedupe_counts_mutex);
 	counts->fiemap_bytes += fiemap_bytes;
 	counts->kern_bytes += kern_bytes;
+	dedupe_groups_done++;		/* for the live status line */
 	g_mutex_unlock(&dedupe_counts_mutex);
 }
 
@@ -588,6 +595,126 @@ static int push_extents(struct results_tree *res)
 	return 0;
 }
 
+/*
+ * Cross-pass dedupe stats and a single, stable, in-place status line.
+ *
+ * duperemove runs the dedupe in a loop (per dedupe_seq batch, whole-file then
+ * extent pass), so dedupe_results() is called many times. To keep the output
+ * from scrolling, we accumulate the totals in these globals across every call
+ * and draw one status line that updates in place; dedupe_end() prints a single
+ * final summary. Nothing here is per-pass.
+ */
+static GThread *dedupe_status_thread_h;
+static volatile int dedupe_status_running;
+static unsigned long long dedupe_total_groups;	/* estimate, for the bar/ETA */
+
+static void draw_dedupe_status(void)
+{
+	const int width = 22;
+	unsigned long long done = dedupe_groups_done;
+	unsigned long long total = dedupe_total_groups;
+	double elapsed = elapsed_seconds();
+
+	printf("\r\33[K  %sDeduplicating%s  ", col_bold, col_reset);
+
+	/*
+	 * A determinate bar + ETA is only shown while the running count is below
+	 * the estimated total. duperemove revisits groups once per dedupe_seq
+	 * batch (already-deduped ones are quick skips but still counted), so on a
+	 * repeatedly-deduped hashfile the count can exceed the distinct-group
+	 * estimate. Rather than pin a misleading "100%" while work continues, we
+	 * fall back to an honest live count with no percentage or ETA.
+	 */
+	if (total && done < total) {
+		int pos = (int)((double)done / total * width);
+		int i;
+
+		printf("%s", col_cyan);
+		for (i = 0; i < width; i++)
+			putchar(i < pos ? '#' : (i == pos ? '>' : '-'));
+		printf("%s %llu/%llu (%d%%) · %s%s%s · %s", col_reset, done, total,
+		       (int)(100.0 * done / total), col_green,
+		       human_size(dedupe_total_bytes), col_reset,
+		       human_duration(elapsed));
+		if (done > 0) {
+			double rate = done / (elapsed > 0 ? elapsed : 1);
+			printf(" · ETA ~%s", human_duration((total - done) / rate));
+		}
+	} else {
+		printf("%s%llu%s groups · %s%s%s reclaimed · %s", col_cyan, done,
+		       col_reset, col_green, human_size(dedupe_total_bytes),
+		       col_reset, human_duration(elapsed));
+	}
+	fflush(stdout);
+}
+
+static void *dedupe_status_thread(void *arg [[maybe_unused]])
+{
+	do {
+		draw_dedupe_status();
+		usleep(200000);
+	} while (dedupe_status_running);
+	printf("\r\33[K");	/* erase the status line; dedupe_end() summarizes */
+	fflush(stdout);
+	return NULL;
+}
+
+/*
+ * Begin the dedupe phase: reset totals and start the in-place status line.
+ * total_groups is an estimate used for the progress bar and ETA (0 = unknown,
+ * in which case the status shows an indeterminate group count).
+ */
+void dedupe_begin(unsigned long long total_groups)
+{
+	dedupe_groups_done = 0;
+	dedupe_total_bytes = 0;
+	dedupe_total_kern = 0;
+	dedupe_total_groups = total_groups;
+
+	if (!quiet && !verbose && isatty(STDOUT_FILENO)) {
+		dedupe_status_running = 1;
+		dedupe_status_thread_h = g_thread_new("dedupe_status",
+						      dedupe_status_thread, NULL);
+	}
+}
+
+/* End the dedupe phase: stop the status line and print one final summary. */
+void dedupe_end(void)
+{
+	if (dedupe_status_thread_h) {
+		dedupe_status_running = 0;
+		g_thread_join(dedupe_status_thread_h);
+		dedupe_status_thread_h = NULL;
+	}
+
+	/* Human summary: skipped by -q. */
+	if (!quiet) {
+		if (dedupe_groups_done == 0) {
+			printf("%sNothing to deduplicate.%s\n", col_dim, col_reset);
+		} else {
+			printf("%s%sSummary%s\n", col_bold, col_blue, col_reset);
+			printf("  %sDeduplicated%s   %s%s%s across %llu group%s\n",
+			       col_dim, col_reset, col_green,
+			       human_size(dedupe_total_bytes), col_reset,
+			       dedupe_groups_done, dedupe_groups_done == 1 ? "" : "s");
+			if (dedupe_total_kern)
+				printf("  %sKernel scanned%s %s\n", col_dim,
+				       col_reset, human_size(dedupe_total_kern));
+			printf("  %sElapsed%s        %.1fs\n",
+			       col_dim, col_reset, elapsed_seconds());
+		}
+	}
+
+	/*
+	 * Stable, exact machine-readable line for scripts. Printed whenever the
+	 * output is not an interactive summary - i.e. piped/redirected, or under
+	 * -q (scripts commonly do `duperemove -qd ... | grep 'net change'`).
+	 */
+	if (!isatty(STDOUT_FILENO) || quiet)
+		printf("Comparison of extent info shows a net change in "
+		       "shared extents of: %s\n", pretty_size(dedupe_total_bytes));
+}
+
 void dedupe_results(struct results_tree *res, bool whole_file)
 {
 	int ret;
@@ -603,14 +730,14 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 
 	whole_file_dedup = whole_file;
 
-	print_dupes_table(res, whole_file);
+	/* The pre-dedupe listing is a wall of text; show it only with -v. */
+	if (verbose)
+		print_dupes_table(res, whole_file);
 
-	if (RB_EMPTY_ROOT(&res->root)) {
-		printf("Nothing to dedupe.\n");
+	if (RB_EMPTY_ROOT(&res->root))
 		return;
-	}
 
-	qprintf("Using %u threads for dedupe phase\n", options.io_threads);
+	vprintf("Using %u threads for dedupe phase\n", options.io_threads);
 
 	dedupe_pool = g_thread_pool_new((GFunc) dedupe_worker, &counts,
 					options.io_threads, TRUE, &err);
@@ -623,21 +750,18 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 
 	total_dedupe_passes = res->num_dupes;
 	leading_spaces = num_digits(total_dedupe_passes);
+
 	ret = push_extents(res);
 	if (ret) {
 		eprintf("Fatal error while deduping: %s\n", err->message);
 		g_error_free(err);
 	}
 
-	g_thread_pool_free(dedupe_pool, FALSE, TRUE);
+	g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for all work */
 
-	if (ret == 0) {
-		vprintf("Kernel processed data (excludes target files): "
-			"%s\n", pretty_size(counts.kern_bytes));
-		printf("Comparison of extent info shows a net "
-		       "change in shared extents of: %s\n",
-		       pretty_size(counts.fiemap_bytes));
-	}
+	/* Roll this pass's totals into the cross-pass accumulators. */
+	dedupe_total_bytes += counts.fiemap_bytes;
+	dedupe_total_kern += counts.kern_bytes;
 }
 
 int fdupes_dedupe(void)
