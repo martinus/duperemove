@@ -80,55 +80,22 @@ struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 	return NULL;
 }
 
-struct fiemap *do_fiemap(int fd)
+/*
+ * Map `count` extents of [start, start+length) into a freshly allocated fiemap.
+ * `count` normally comes from a preceding fiemap_count_extents() pass. Returns
+ * NULL on allocation or ioctl error.
+ */
+static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
+				 unsigned int count)
 {
-	int err;
-
-	struct fiemap *fiemap = NULL;
-	unsigned int count = fiemap_count_extents(fd, 0, ~0ULL);
+	struct fiemap *fiemap;
 
 	/*
-	 * Our structure must be large enough to fit:
-	 * - one struct fiemap = 32 bytes
-	 * - $count struct fiemap_extent = count * 56 bytes
-	 * - $count struct fiemap_extent* = count * 4 bytes
-	 * See https://www.kernel.org/doc/Documentation/filesystems/fiemap.txt
+	 * The structure must be large enough to fit one struct fiemap plus
+	 * $count struct fiemap_extent. We over-allocate a pointer per extent to
+	 * match historical behaviour; it is harmless. See
+	 * https://www.kernel.org/doc/Documentation/filesystems/fiemap.txt
 	 */
-	fiemap = calloc(1, sizeof(struct fiemap) +
-			count * (sizeof(struct fiemap_extent) +
-			sizeof(struct fiemap_extent *)));
-
-	fiemap->fm_start = 0;
-	fiemap->fm_length = ~0ULL;
-	fiemap->fm_extent_count = count;
-
-	err = ioctl(fd, FS_IOC_FIEMAP, fiemap);
-	if (err < 0) {
-		perror("fiemap");
-		free(fiemap);
-		return NULL;
-	}
-
-	if (fiemap->fm_mapped_extents != count)
-		dprintf("do_fiemap: file changed between fiemap calls\n");
-
-	return fiemap;
-}
-
-/*
- * Like do_fiemap() but only maps the [start, start+length) byte range. The
- * dedupe phase only needs the extent(s) at one offset, so this avoids
- * enumerating the whole (possibly huge/fragmented) file's extent map.
- */
-struct fiemap *do_fiemap_range(int fd, uint64_t start, uint64_t length)
-{
-	int err;
-	struct fiemap *fiemap = NULL;
-	unsigned int count = fiemap_count_extents(fd, start, length);
-
-	if (count == 0)
-		return NULL;
-
 	fiemap = calloc(1, sizeof(struct fiemap) +
 			count * (sizeof(struct fiemap_extent) +
 			sizeof(struct fiemap_extent *)));
@@ -139,17 +106,36 @@ struct fiemap *do_fiemap_range(int fd, uint64_t start, uint64_t length)
 	fiemap->fm_length = length;
 	fiemap->fm_extent_count = count;
 
-	err = ioctl(fd, FS_IOC_FIEMAP, fiemap);
-	if (err < 0) {
-		perror("do_fiemap_range");
+	if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
+		perror("fiemap");
 		free(fiemap);
 		return NULL;
 	}
 
 	if (fiemap->fm_mapped_extents != count)
-		dprintf("do_fiemap_range: file changed between fiemap calls\n");
+		dprintf("fiemap: file changed between fiemap calls\n");
 
 	return fiemap;
+}
+
+struct fiemap *do_fiemap(int fd)
+{
+	return fiemap_map(fd, 0, ~0ULL, fiemap_count_extents(fd, 0, ~0ULL));
+}
+
+/*
+ * Like do_fiemap() but only maps the [start, start+length) byte range. The
+ * dedupe phase only needs the extent(s) at one offset, so this avoids
+ * enumerating the whole (possibly huge/fragmented) file's extent map. Returns
+ * NULL when the range maps no extents (a hole) as well as on error.
+ */
+struct fiemap *do_fiemap_range(int fd, uint64_t start, uint64_t length)
+{
+	unsigned int count = fiemap_count_extents(fd, start, length);
+
+	if (count == 0)
+		return NULL;
+	return fiemap_map(fd, start, length, count);
 }
 
 /*
