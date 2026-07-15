@@ -614,29 +614,36 @@ static void draw_dedupe_status(void)
 	unsigned long long done = dedupe_groups_done;
 	unsigned long long total = dedupe_total_groups;
 	double elapsed = elapsed_seconds();
-	int i, pos;
-	char eta[16] = "";
-
-	if (total && done > total)	/* estimate was low; don't overflow */
-		total = done;
-	pos = total ? (int)((double)done / total * width) : 0;
 
 	printf("\r\33[K  %sDeduplicating%s  ", col_bold, col_reset);
-	if (total) {
+
+	/*
+	 * A determinate bar + ETA is only shown while the running count is below
+	 * the estimated total. duperemove revisits groups once per dedupe_seq
+	 * batch (already-deduped ones are quick skips but still counted), so on a
+	 * repeatedly-deduped hashfile the count can exceed the distinct-group
+	 * estimate. Rather than pin a misleading "100%" while work continues, we
+	 * fall back to an honest live count with no percentage or ETA.
+	 */
+	if (total && done < total) {
+		int pos = (int)((double)done / total * width);
+		int i;
+
 		printf("%s", col_cyan);
 		for (i = 0; i < width; i++)
 			putchar(i < pos ? '#' : (i == pos ? '>' : '-'));
-		printf("%s %llu/%llu (%d%%)", col_reset, done, total,
-		       total ? (int)(100.0 * done / total) : 0);
+		printf("%s %llu/%llu (%d%%) · %s%s%s · %s", col_reset, done, total,
+		       (int)(100.0 * done / total), col_green,
+		       human_size(dedupe_total_bytes), col_reset,
+		       human_duration(elapsed));
+		if (done > 0) {
+			double rate = done / (elapsed > 0 ? elapsed : 1);
+			printf(" · ETA ~%s", human_duration((total - done) / rate));
+		}
 	} else {
-		printf("%s%llu groups%s", col_cyan, done, col_reset);
-	}
-	printf(" · %s%s%s · %s", col_green, human_size(dedupe_total_bytes),
-	       col_reset, human_duration(elapsed));
-	if (total && done > 0 && done < total) {
-		double rate = done / (elapsed > 0 ? elapsed : 1);
-		snprintf(eta, sizeof(eta), "%s", human_duration((total - done) / rate));
-		printf(" · ETA ~%s", eta);
+		printf("%s%llu%s groups · %s%s%s reclaimed · %s", col_cyan, done,
+		       col_reset, col_green, human_size(dedupe_total_bytes),
+		       col_reset, human_duration(elapsed));
 	}
 	fflush(stdout);
 }
