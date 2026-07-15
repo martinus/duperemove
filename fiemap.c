@@ -26,8 +26,8 @@
  * Empty fiemap ioctl to count the extents overlapping [start, start+length).
  * Pass start=0, length=~0ULL for the whole file. Returns 0 on error.
  */
-static unsigned int fiemap_count_extents(int fd, uint64_t start,
-					 uint64_t length)
+unsigned int fiemap_count_extents(int fd, uint64_t start,
+				  uint64_t length)
 {
 	struct fiemap fiemap = {0,};
 	int err;

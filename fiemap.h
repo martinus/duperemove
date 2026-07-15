@@ -43,4 +43,11 @@ int fiemap_first_extent_poff(int fd, uint64_t start, uint64_t length,
  * Count how much of the area between start_off and end_off is shared.
  */
 int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shared);
+
+/*
+ * Number of physical extents overlapping [start, start+length), via a single
+ * empty fiemap ioctl (no per-extent buffer). Pass start=0, length=~0ULL for the
+ * whole file. Returns 0 on error.
+ */
+unsigned int fiemap_count_extents(int fd, uint64_t start, uint64_t length);
 #endif	/* __FIEMAP_H__ */
