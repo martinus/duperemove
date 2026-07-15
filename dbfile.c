@@ -883,6 +883,57 @@ int dbfile_get_stats(struct dbhandle *db, struct dbfile_stats *stats)
 	return ret;
 }
 
+/* Read a single-integer PRAGMA (e.g. "PRAGMA page_count"). */
+static int dbfile_pragma_uint64(sqlite3 *db, const char *pragma, uint64_t *out)
+{
+	sqlite3_stmt *stmt = NULL;
+	int ret = sqlite3_prepare_v2(db, pragma, -1, &stmt, NULL);
+
+	if (ret != SQLITE_OK)
+		return ret;
+
+	ret = sqlite3_step(stmt);
+	if (ret == SQLITE_ROW) {
+		*out = sqlite3_column_int64(stmt, 0);
+		ret = SQLITE_OK;
+	} else if (ret == SQLITE_DONE) {
+		ret = SQLITE_ERROR;
+	}
+
+	sqlite3_finalize(stmt);
+	return ret;
+}
+
+/*
+ * VACUUM reclaims free pages, but SQLite reuses them - so under normal scanning
+ * the freelist stays near empty and a full-database rewrite would reclaim
+ * nothing. It only fills up after a large prune (e.g. many deleted files
+ * removed from the hashfile), which is exactly when the rewrite pays off. So
+ * VACUUM only when a meaningful fraction of the file is actually free.
+ */
+#define VACUUM_FREE_PCT		25
+
+void dbfile_maybe_vacuum(struct dbhandle *db)
+{
+	uint64_t freelist = 0, total = 0;
+	int ret;
+
+	if (dbfile_pragma_uint64(db->db, "PRAGMA freelist_count", &freelist) ||
+	    dbfile_pragma_uint64(db->db, "PRAGMA page_count", &total))
+		return;
+
+	if (total == 0 || freelist * 100 < total * VACUUM_FREE_PCT)
+		return;
+
+	vprintf("Vacuuming hashfile: %"PRIu64" of %"PRIu64" pages free\n",
+		freelist, total);
+
+	/* Maintenance only: a failure here must not fail the run. */
+	ret = sqlite3_exec(db->db, "VACUUM", NULL, NULL, NULL);
+	if (ret)
+		perror_sqlite(ret, "vacuuming hashfile");
+}
+
 static int get_config_int(sqlite3_stmt *stmt, const char *name, int *val)
 {
 	int ret;
