@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
+            uuid-dev libbsd-dev libxxhash-dev \
+            btrfs-progs
+
+      - name: Build
+        run: make
+
+      - name: Unit tests
+        run: make test
+
+      # Dedupe integration tests need a reflink-capable filesystem, which the
+      # runner's ext4 root is not. Back a small btrfs with a loopback image and
+      # point the suite's scratch dir at it. Without this the dedupe tests would
+      # skip (the harness detects the lack of reflink) but everything else runs.
+      - name: Set up a scratch btrfs
+        run: |
+          sudo modprobe btrfs || true
+          IMG="$RUNNER_TEMP/duperemove-scratch.img"
+          truncate -s 2G "$IMG"
+          mkfs.btrfs -q "$IMG"
+          sudo mkdir -p /mnt/duperemove-scratch
+          sudo mount -o loop "$IMG" /mnt/duperemove-scratch
+          sudo chmod 1777 /mnt/duperemove-scratch
+
+      - name: Integration tests
+        run: make integration
+        env:
+          DUPEREMOVE_TEST_DIR: /mnt/duperemove-scratch
