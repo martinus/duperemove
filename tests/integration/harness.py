@@ -201,8 +201,14 @@ class DuperemoveTest(unittest.TestCase):
     # -- hashfile (SQLite) inspection --------------------------------------
 
     def hf_query(self, sql, params=()):
-        with sqlite3.connect(self.hf) as con:
+        # NB: `with sqlite3.connect(...)` commits but does NOT close the
+        # connection - a lingering reader would hold a WAL lock and block a
+        # later duperemove run (e.g. its VACUUM). Close it explicitly.
+        con = sqlite3.connect(self.hf)
+        try:
             return con.execute(sql, params).fetchall()
+        finally:
+            con.close()
 
     def hf_count(self, table):
         return self.hf_query(f"select count(*) from {table}")[0][0]

@@ -99,6 +99,9 @@ struct dbfile_stats {
 };
 int dbfile_get_stats(struct dbhandle *db, struct dbfile_stats *stats);
 
+/* VACUUM the hashfile, but only when enough of it is free to be worth it. */
+void dbfile_maybe_vacuum(struct dbhandle *db);
+
 uint64_t count_file_by_digest(struct dbhandle *db, unsigned char *digest,
 				bool show_block_hashes);
 

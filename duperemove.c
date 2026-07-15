@@ -781,6 +781,11 @@ int main(int argc, char **argv)
 	if (use_hashfile == H_READ || use_hashfile == H_UPDATE)
 		process_duplicates(db);
 
+	/* Reclaim space if a prune this run left the hashfile mostly free. */
+	if (options.hashfile &&
+	    (use_hashfile == H_WRITE || use_hashfile == H_UPDATE))
+		dbfile_maybe_vacuum(db);
+
 out:
 	free_all_filerecs();
 
