@@ -583,9 +583,11 @@ static void process_duplicates(struct dbhandle *db)
 	/*
 	 * Ensure the find-dupes indexes exist. Normally built at the end of the
 	 * scan; this covers read-only runs (no scan this invocation) and older
-	 * hashfiles.
+	 * hashfiles. Best-effort: the indexes only speed up the lookups below,
+	 * which are correct without them, so a failure here (e.g. a read-only
+	 * hashfile) is logged by the callee but must not abort the dedupe.
 	 */
-	dbfile_create_search_indexes(db);
+	(void)dbfile_create_search_indexes(db);
 
 	/* Spawn a dedicated thread pool to block-based lookup */
 	if (options.do_block_hash)

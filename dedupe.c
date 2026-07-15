@@ -341,7 +341,10 @@ static void clamp_len_to_ioctl_file(struct dedupe_ctxt *ctxt)
 		/*
 		 * The source range no longer exists at all. Move every queued
 		 * request to the completed list so the caller cleans up without
-		 * issuing a doomed ioctl.
+		 * issuing a doomed ioctl. These reqs keep their initial state
+		 * (req_status 0, req_total 0), so pop_one_dedupe_result() reports
+		 * each as a quiet 0-byte no-op rather than an error - which is
+		 * what we want, since nothing was (or could be) deduped here.
 		 */
 		dprintf("Skipping dedupe: source offset %llu is past the end "
 			"of file \"%s\" (size %llu)\n",
