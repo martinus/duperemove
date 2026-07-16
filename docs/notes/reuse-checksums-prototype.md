@@ -48,15 +48,41 @@ Two ways it hits:
 
 Measured (snapshot rescan, 2 GiB reflinked copy, cold cache): **0.69s → 0.01s**.
 
+## When it actually helps (measured)
+
+The reuse skips *reading and hashing*, so it only speeds up the wall clock when
+reading is the bottleneck:
+
+- **Large files / slow disk / huge shared sets** (the 36.5 TB-of-snapshots case
+  in the issue): big win. Measured cross-run, 8×256 MB reflinked snapshot, cold
+  cache: **9.0s → 2.0s**.
+- **Many small files on fast storage** (e.g. git repos on NVMe): the scan is
+  *metadata-bound*, not read-bound, so even though the reads are skipped the
+  wall time barely moves. Measured 4000×1 MB reflinked twins, cold cache:
+  2.03s → 2.03s (2 GiB not re-read, but no wall-time gain). Don't expect this
+  workflow to benefit.
+
+Hit-rate note: the lookup reads through a per-thread connection that sees the
+scan writer's *committed* batches. So the strong case is **cross-run** (a
+snapshot appears, you rescan with the hashfile from before) where the originals
+are already committed. **Intra-run** reuse (a tree and its twin scanned in one
+fresh-hashfile run) only hits for copies whose twin was already committed when
+they're reached, which is timing-dependent and can be low.
+
 ## Prototype limitations (why it's not merge-ready)
 
-- The reuse lookup uses per-call prepared statements under the scan write lock.
-  A production version should cache the statements and read through a per-thread
-  handle to avoid serializing the parallel scan.
+- Each scan worker opens its own read handle (`dbfile_open_reader`) and caches
+  the lookup statements thread-locally; those handles are never explicitly
+  closed (the OS reclaims them at exit). A production version would own their
+  lifecycle.
+- The reader sees only *committed* batches, which caps intra-run hit rate (see
+  the hit-rate note above). A production version might commit more eagerly or
+  keep a small in-memory index of extents hashed this run.
 - Only the default extent path is covered; `--dedupe-options=partial` (block
   hashes) falls back to reading.
 - It builds and maintains an `extents(poff, len)` index while the option is on;
-  that per-insert cost is part of what the A/B measures.
+  that per-insert cost is part of what the A/B measures, and on a
+  low-sharing/metadata-bound tree it can make the scan slightly slower.
 - Reusing a digest by physical offset across runs assumes the address still
   holds the same data. That's true for live btrfs extents, and the dedupe ioctl
   byte-verifies regardless, but a fully robust version might store/validate an

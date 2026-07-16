@@ -173,10 +173,12 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 struct fiemap;
 struct extent_csum;
 /*
- * #386 prototype: reuse an already-hashed byte-identical file's digests instead
- * of reading. Returns 1 and fills extents/num_extents/digest_out on a hit, else
- * 0. See dbfile.c for correctness notes.
+ * #386 prototype: a bare read-only-usage handle (no schema writes) for the scan
+ * workers' reuse lookups, and the lookup itself. dbfile_reuse_file_hashes()
+ * returns 1 and fills extents/num_extents/digest_out on a hit, else 0. See
+ * dbfile.c for correctness notes.
  */
+struct dbhandle *dbfile_open_reader(char *filename);
 int dbfile_reuse_file_hashes(struct dbhandle *db, struct fiemap *fiemap,
 			     uint64_t filesize, struct extent_csum *extents,
 			     unsigned int *num_extents, unsigned char *digest_out);

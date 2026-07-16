@@ -1546,14 +1546,22 @@ static void csum_whole_file(struct file_to_scan *file)
 	 * the write lock (the scan workers share one connection); the win is
 	 * that the expensive read below is then skipped entirely.
 	 */
+	static __thread struct dbhandle *reuse_rdb;
 	bool reused = false;
 	if (options.reuse_checksums && !options.do_block_hash) {
-		dbfile_lock();
-		reused = dbfile_reuse_file_hashes(db, ctxt.fiemap, ctxt.filesize,
-						  hashes.extents,
-						  &hashes.extents_index,
-						  file_digest);
-		dbfile_unlock();
+		/*
+		 * Read through a per-thread handle, not the shared writer under
+		 * the write lock - the lookup runs per file (millions of times),
+		 * so serializing the parallel scan on one lock was far more
+		 * expensive than the reads it saved. WAL lets these run
+		 * concurrently; they see the writer's committed batches.
+		 */
+		if (!reuse_rdb)
+			reuse_rdb = dbfile_open_reader(options.hashfile);
+		if (reuse_rdb)
+			reused = dbfile_reuse_file_hashes(reuse_rdb, ctxt.fiemap,
+					ctxt.filesize, hashes.extents,
+					&hashes.extents_index, file_digest);
 		if (reused) {
 			finish_running_checksum(ctxt.file_csum, NULL);
 			ctxt.file_csum = NULL;

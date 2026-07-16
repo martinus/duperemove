@@ -1635,28 +1635,74 @@ out:
  * physical address still holds the same data (true for live btrfs extents; the
  * dedupe ioctl byte-verifies regardless).
  */
+/*
+ * #386 prototype: a bare read connection for the scan workers' reuse lookups.
+ * Unlike dbfile_open_handle() it does NOT run create_tables/create_indexes -
+ * those are schema writes that would deadlock against the active scan writer
+ * (each worker opening one would block on its transaction). The hashfile is
+ * already set up by the main writer handle; this connection only runs SELECTs.
+ * NOMUTEX is fine: each worker gets its own handle. Never explicitly closed
+ * (prototype); the OS reclaims it at exit.
+ */
+struct dbhandle *dbfile_open_reader(char *filename)
+{
+	struct dbhandle *h = calloc(1, sizeof(*h));
+
+	if (!h)
+		return NULL;
+	if (sqlite3_open_v2(filename, &h->db,
+			    SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX,
+			    NULL) != SQLITE_OK) {
+		if (h->db)
+			sqlite3_close(h->db);
+		free(h);
+		return NULL;
+	}
+	sqlite3_busy_timeout(h->db, 30000);
+	sqlite3_exec(h->db, "PRAGMA cache_size = -16000", NULL, NULL, NULL);
+	return h;
+}
+
 int dbfile_reuse_file_hashes(struct dbhandle *db, struct fiemap *fiemap,
 			     uint64_t filesize, struct extent_csum *extents,
 			     unsigned int *num_extents, unsigned char *digest_out)
 {
 	unsigned int n = fiemap->fm_mapped_extents;
-	sqlite3_stmt *cand = NULL, *fi = NULL, *ex = NULL;
+	/*
+	 * Prepared once per thread and reused: the scan runs these lookups
+	 * millions of times, so re-preparing each call dominated. Each scan
+	 * worker calls this on its own read-only handle (no shared lock), so a
+	 * thread-local cache is safe. `prepared_for` guards against the handle
+	 * changing under us.
+	 */
+	static __thread sqlite3 *prepared_for;
+	static __thread sqlite3_stmt *cand, *fi, *ex;
 	int found = 0;
 
 	if (n == 0)
 		return 0;
 
-	if (sqlite3_prepare_v2(db->db,
-		"select fileid from extents where poff = ?1 and len = ?2 limit 16",
-		-1, &cand, NULL) ||
-	    sqlite3_prepare_v2(db->db,
-		"select size, digest from files where id = ?1 and digest is not null",
-		-1, &fi, NULL) ||
-	    sqlite3_prepare_v2(db->db,
-		"select loff, poff, len, digest from extents where fileid = ?1 "
-		"order by loff", -1, &ex, NULL))
-		goto out;
+	if (prepared_for != db->db) {
+		sqlite3_finalize(cand);
+		sqlite3_finalize(fi);
+		sqlite3_finalize(ex);
+		cand = fi = ex = NULL;
+		if (sqlite3_prepare_v2(db->db,
+			"select fileid from extents where poff = ?1 and len = ?2 limit 16",
+			-1, &cand, NULL) ||
+		    sqlite3_prepare_v2(db->db,
+			"select size, digest from files where id = ?1 and digest is not null",
+			-1, &fi, NULL) ||
+		    sqlite3_prepare_v2(db->db,
+			"select loff, poff, len, digest from extents where fileid = ?1 "
+			"order by loff", -1, &ex, NULL)) {
+			prepared_for = NULL;
+			return 0;
+		}
+		prepared_for = db->db;
+	}
 
+	sqlite3_reset(cand);
 	sqlite3_bind_int64(cand, 1, fiemap->fm_extents[0].fe_physical);
 	sqlite3_bind_int64(cand, 2, fiemap->fm_extents[0].fe_length);
 
@@ -1707,10 +1753,10 @@ int dbfile_reuse_file_hashes(struct dbhandle *db, struct fiemap *fiemap,
 			found = 1;
 		}
 	}
-out:
-	sqlite3_finalize(cand);
-	sqlite3_finalize(fi);
-	sqlite3_finalize(ex);
+	/* Statements are cached (thread-local); leave them prepared for reuse. */
+	sqlite3_reset(cand);
+	sqlite3_reset(fi);
+	sqlite3_reset(ex);
 	return found;
 }
 
