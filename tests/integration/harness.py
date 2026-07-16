@@ -314,6 +314,12 @@ class DuperemoveTest(unittest.TestCase):
         os.truncate(p, size)
         return p
 
+    def reflink(self, src_rel, dst_rel):
+        """Make dst a reflink (shared-extent) copy of src; returns dst path."""
+        src, dst = self.path(src_rel), self.path(dst_rel)
+        subprocess.run(["cp", "--reflink=always", src, dst], check=True)
+        return dst
+
     def hardlink(self, rel_src, rel_dst):
         dst = self.path(rel_dst)
         os.link(self.path(rel_src), dst)

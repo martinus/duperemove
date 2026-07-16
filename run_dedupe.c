@@ -107,6 +107,9 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
  */
 static _Atomic uint64_t dedupe_dest_differs;
 static _Atomic uint64_t dedupe_dest_errors;
+/* Destinations skipped because they already shared all storage with the
+ * target (deduping them would have been a no-op). See fiemap_ranges_shared(). */
+static _Atomic uint64_t dedupe_dest_already_shared;
 
 static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 				   uint64_t *kern_bytes)
@@ -333,6 +336,9 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	struct extent *extent;
 	struct dedupe_ctxt *ctxt = NULL;
 	uint64_t len = dext->de_len;
+	/* Target's extent map, fetched once and reused to skip already-shared
+	 * destinations (see the shared-check below). */
+	_cleanup_(freep) struct fiemap *tgt_map = NULL;
 	OPEN_ONCE(open_files);
 	struct extent *tgt_extent = NULL;
 
@@ -494,6 +500,32 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			 */
 			if (tgt_extent == extent)
 				continue;
+		}
+
+		/*
+		 * Skip a destination that already maps to the exact same
+		 * physical extents as the target: deduping it would be a
+		 * byte-for-byte no-op, but the kernel still reads and compares
+		 * the whole range, which is the dominant cost on already-shared
+		 * trees like repeated snapshots (upstream #331). The target map
+		 * is fetched once (a couple of cheap metadata ioctls) and reused
+		 * for every destination; it never skips a real dedupe (see
+		 * fiemap_range_shared_with()).
+		 */
+		if (!tgt_map)
+			tgt_map = do_fiemap_range(tgt_extent->e_file->fd,
+						  tgt_extent->e_loff, len);
+		if (fiemap_range_shared_with(tgt_map, tgt_extent->e_loff,
+					     extent->e_file->fd, extent->e_loff,
+					     len)) {
+			atomic_fetch_add(&dedupe_dest_already_shared, 1);
+			slot->file_scanned_bytes += len;
+			vprintf("[%p] %s already shares the target's extents; "
+				"skipping.\n", g_thread_self(),
+				extent->e_file->filename);
+			if (ctxt && last)
+				goto run_dedupe;
+			continue;
 		}
 
 		rc = add_extent_to_dedupe(ctxt, extent->e_loff, extent->e_file);
@@ -772,6 +804,11 @@ void dedupe_end(void)
 			       col_dim, col_reset,
 			       (uint64_t)dedupe_dest_differs,
 			       (uint64_t)dedupe_dest_errors);
+		if (dedupe_dest_already_shared)
+			printf("  %sAlready shared%s %lu file%s skipped (no work "
+			       "needed)\n", col_dim, col_reset,
+			       (uint64_t)dedupe_dest_already_shared,
+			       dedupe_dest_already_shared == 1 ? "" : "s");
 	}
 
 	/*
