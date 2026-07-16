@@ -1323,15 +1323,19 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 	while (file_off < ctxt->off + bytes) {
 		extent = get_extent(ctxt->fiemap, file_off, &ctxt->extent_cursor);
 		if (!extent) {
-			eprintf("process_extents: unable to get extent\n");
-
-			/* Cleanup the partial checksum and skip
-			 * the rest of the buffer
+			/*
+			 * No extent covers file_off, and get_extent() returns
+			 * the next extent for a hole, so this means file_off is
+			 * past the last mapped extent: a trailing hole in a
+			 * sparse file (FIEMAP does not report holes). There is
+			 * no more data to checksum here - the last real extent
+			 * was already stored below - so stop cleanly instead of
+			 * aborting the whole file's scan.
 			 */
 			if (ctxt->extent_csum)
 				finish_running_checksum(ctxt->extent_csum, NULL);
 			ctxt->extent_csum = NULL;
-			return 1;
+			return 0;
 		}
 
 		ext_end_off = extent->fe_logical + extent->fe_length;
@@ -1362,10 +1366,14 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 		 * to the block size of the file system.
 		 * So, if we are processing the last extent, then
 		 * ext_end_off may be larger than the filesize. For those extents, add
-		 * the part that will never exist.
+		 * the part that will never exist. Only when the extent actually
+		 * runs past EOF though - a last extent that ends before filesize
+		 * (a file with a trailing hole) must not underflow dummy, or the
+		 * store below would never fire and the extent would be lost.
 		 */
 		size_t dummy = 0;
-		if (extent->fe_flags & FIEMAP_EXTENT_LAST)
+		if ((extent->fe_flags & FIEMAP_EXTENT_LAST) &&
+		    ext_end_off > ctxt->filesize)
 			dummy = ext_end_off - ctxt->filesize;
 		if (file_off + dummy == ext_end_off) {
 			ret = store_extent(ctxt, hashes, extent);
