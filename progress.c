@@ -112,50 +112,77 @@ void pscan_examined(void)
 }
 
 #define BUF_LEN 10*1024
+/*
+ * Fit `path` into at most `cols` columns by replacing its middle with a
+ * single ellipsis, so both the leading directories and the filename stay
+ * readable. The filename end matters more, so it gets the bigger share.
+ */
+static void ellipsize_path(const char *path, char *out, size_t out_len,
+			   int cols)
+{
+	int len = strlen(path);
+	int head, tail;
+
+	if (cols >= len) {
+		snprintf(out, out_len, "%s", path);
+		return;
+	}
+	if (cols < 8)
+		cols = 8;
+
+	head = (cols - 1) * 2 / 5;
+	tail = cols - 1 - head;
+	snprintf(out, out_len, "%.*s…%s", head, path, path + len - tail);
+}
+
 static void print_thread_progress(struct pscan_thread *tprogress)
 {
 	char buf[BUF_LEN];
+	char prefix[64], suffix[128], path[PATH_MAX + 4];
+	int avail;
 
 	switch (tprogress->status) {
 	case thread_idle:
-		snprintf(buf, BUF_LEN, "[%u] idle", tprogress->tid);
-		break;
+		s_printf("[%u] idle\n", tprogress->tid);
+		return;
 	case thread_scanning:
-		snprintf(buf, BUF_LEN, "[%u] %-20s%s: %s/%s (%05.2f%%)",
-			tprogress->tid,
-			"checksumming:",
-			tprogress->file_path,
-			human_size(tprogress->file_scanned_bytes),
-			human_size(tprogress->file_total_bytes),
-			percent(tprogress->file_scanned_bytes, tprogress->file_total_bytes));
+	case thread_deduping:
+		snprintf(prefix, sizeof(prefix), "[%u] %-20s", tprogress->tid,
+			 tprogress->status == thread_scanning ?
+			 "checksumming:" : "deduping:");
+		snprintf(suffix, sizeof(suffix), ": %s/%s (%05.2f%%)",
+			 human_size(tprogress->file_scanned_bytes),
+			 human_size(tprogress->file_total_bytes),
+			 percent(tprogress->file_scanned_bytes,
+				 tprogress->file_total_bytes));
 		break;
 	case thread_waiting_lock:
-		snprintf(buf, BUF_LEN, "[%u] %-20s%s (size: %s)",
-			tprogress->tid,
-			"waiting for lock:",
-			tprogress->file_path,
-			human_size(tprogress->file_total_bytes));
-		break;
 	case thread_committing:
-		snprintf(buf, BUF_LEN, "[%u] %-20s%s (size: %s)",
-			tprogress->tid,
-			"committing:",
-			tprogress->file_path,
-			human_size(tprogress->file_total_bytes));
-		break;
-	case thread_deduping:
-		snprintf(buf, BUF_LEN, "[%u] %-20s%s: %s/%s (%05.2f%%)",
-			tprogress->tid,
-			"deduping:",
-			tprogress->file_path,
-			human_size(tprogress->file_scanned_bytes),
-			human_size(tprogress->file_total_bytes),
-			percent(tprogress->file_scanned_bytes, tprogress->file_total_bytes));
+		snprintf(prefix, sizeof(prefix), "[%u] %-20s", tprogress->tid,
+			 tprogress->status == thread_waiting_lock ?
+			 "waiting for lock:" : "committing:");
+		snprintf(suffix, sizeof(suffix), " (size: %s)",
+			 human_size(tprogress->file_total_bytes));
 		break;
 	}
 
-	/* Truncate the output to keep at most one line per thread */
-	s_printf("%.*s\n", w_col, buf);
+	/*
+	 * The numbers on the right must stay visible: give the path whatever
+	 * width remains and shorten its middle, never the suffix.
+	 */
+	if (w_col == UINT_MAX)
+		avail = INT_MAX;
+	else
+		avail = (int)w_col - (int)strlen(prefix) - (int)strlen(suffix);
+	ellipsize_path(tprogress->file_path, path, sizeof(path), avail);
+
+	/*
+	 * No byte-truncation here: it would eat the suffix (the ellipsis is
+	 * three bytes for one column). Column width never exceeds byte length
+	 * in UTF-8, so the width budget above already guarantees the fit.
+	 */
+	snprintf(buf, BUF_LEN, "%s%s%s", prefix, path, suffix);
+	s_printf("%s\n", buf);
 }
 
 static void print_scan_progress(void)
