@@ -26,6 +26,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 #include <glib.h>
 
@@ -412,6 +413,42 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			if (ctxt && last)
 				goto run_dedupe;
 			continue;
+		}
+
+		/*
+		 * The file may have been rewritten since it was scanned. A
+		 * range past the current EOF makes the kernel fail the whole
+		 * destination with EINVAL, as does an unaligned length that no
+		 * longer ends exactly at EOF (whole-file dedupe of odd-sized
+		 * files relies on that). Either way the content changed - skip
+		 * the member and let the next scan re-hash it, and count it
+		 * with the "changed since scan" results.
+		 *
+		 * Whole-file groups carry the exact scanned size, so any size
+		 * change disqualifies. Extent lengths come from fiemap and are
+		 * rounded up to the next block, so a final extent legitimately
+		 * overshoots EOF by up to a block (clamped before the ioctl) -
+		 * only a shortfall of a whole block or more means the file
+		 * really shrank.
+		 */
+		{
+			struct stat st;
+
+			if (fstat(extent->e_file->fd, &st) == 0 &&
+			    (whole_file_dedup ?
+			     (uint64_t)st.st_size != len :
+			     (uint64_t)st.st_size + 4095 < extent->e_loff + len)) {
+				atomic_fetch_add(&dedupe_dest_differs, 1);
+				vprintf("%s: changed since scan (size %llu, "
+					"expected %llu). Skipping dedupe.\n",
+					extent->e_file->filename,
+					(unsigned long long)st.st_size,
+					(unsigned long long)(extent->e_loff + len));
+				/* stays on open_files; closed with the group */
+				if (ctxt && last)
+					goto run_dedupe;
+				continue;
+			}
 		}
 
 		vprintf("[%p] Add extent for file \"%s\" at offset %s (%d)\n",
