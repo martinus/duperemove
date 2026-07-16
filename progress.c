@@ -13,6 +13,7 @@
  */
 #include <sys/ioctl.h>
 #include <stdatomic.h>
+#include <inttypes.h>
 
 #include "debug.h"
 #include "opt.h"
@@ -139,6 +140,7 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 {
 	char buf[BUF_LEN];
 	char prefix[64], suffix[128], path[PATH_MAX + 4];
+	char clean[PATH_MAX + 1];
 	int avail;
 
 	switch (tprogress->status) {
@@ -174,7 +176,9 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 		avail = INT_MAX;
 	else
 		avail = (int)w_col - (int)strlen(prefix) - (int)strlen(suffix);
-	ellipsize_path(tprogress->file_path, path, sizeof(path), avail);
+	/* Never emit raw control bytes from a filename to the terminal (#353). */
+	sanitize_ctrl(tprogress->file_path, clean, sizeof(clean));
+	ellipsize_path(clean, path, sizeof(path), avail);
 
 	/*
 	 * No byte-truncation here: it would eat the suffix (the ellipsis is
@@ -198,13 +202,14 @@ static void print_scan_progress(void)
 		 * know - files walked and how many need (re)hashing - rather than
 		 * a misleading 0/0.
 		 */
-		s_printf("\tListing files: %lu examined\n", pscan.files_examined);
-		s_printf("\t%lu need hashing\n", tf);
+		s_printf("\tListing files: %" PRIu64 " examined\n",
+			 pscan.files_examined);
+		s_printf("\t%" PRIu64 " need hashing\n", tf);
 		s_printf("\tFile listing: in progress\n");
 		return;
 	}
 
-	s_printf("\tFiles scanned: %lu/%lu (%05.2f%%)\n",
+	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)\n",
 	      files_scanned, tf, tf ? (double)files_scanned / tf * 100 : 100.0);
 	s_printf("\tBytes scanned: %s/%s (%05.2f%%)",
 	      human_size(bytes_scanned), human_size(tb),
@@ -241,7 +246,8 @@ static void print_dedupe_progress(void)
 			pct = 99;
 	}
 
-	s_printf("\tGroups deduped: %lu/~%lu (%u%%)", done, total, pct);
+	s_printf("\tGroups deduped: %" PRIu64 "/~%" PRIu64 " (%u%%)",
+		 done, total, pct);
 	if (pdd.batches > 1)
 		printf(" · batch %u/%u", pdd.batch, pdd.batches);
 	printf("\n");
@@ -251,7 +257,7 @@ static void print_dedupe_progress(void)
 
 	s_printf("\tStatus: %s", pdd.activity ? pdd.activity : "working");
 	if (st)
-		printf(" (%lu/%lu files)", sd, st);
+		printf(" (%" PRIu64 "/%" PRIu64 " files)", sd, st);
 	if (elapsed > 1.0)
 		printf(" · elapsed %s", human_duration(elapsed));
 	if (done > 20 && elapsed > 2.0 && done < total)
@@ -569,7 +575,9 @@ static void *psearch_progress_thread(void * p)
 		int pos;
 		int width = 40;
 
-		pos = (float) search_processed / search_total * width;
+		/* Guard the empty-search case so pos is 0, not NaN (#348). */
+		pos = search_total ?
+			(float) search_processed / search_total * width : width;
 
 		/* Only update our status every width% */
 		if (pos > last_pos) {
