@@ -68,12 +68,32 @@ static uint64_t files_scanned, bytes_scanned;
  */
 static _Atomic uint64_t search_total, search_processed;
 
+/*
+ * Dedupe-phase status. The counters accumulate whether or not the live
+ * display runs (they feed the final summary). `running` gates the printer
+ * thread; `phase` switches the shared screen area between scan and dedupe
+ * rendering.
+ */
+static struct {
+	bool			phase;		/* rendering dedupe, not scan */
+	volatile int		running;
+	gint64			start_us;	/* phase start, monotonic */
+
+	_Atomic uint64_t	done;		/* groups finished */
+	_Atomic uint64_t	queued;		/* groups pushed to the pool */
+	uint64_t		estimate;	/* fuzzy total, see dbfile */
+	unsigned int		batch, batches;
+	const char		*activity;	/* static string */
+	_Atomic uint64_t	reclaimed, kern;
+} pdd;
+
 #define s_save_pos() if (tty) printf("\33[s");
 #define s_restore_pos() if (tty) printf("\33[u");
 #define s_clear() if (tty) printf("\33[J");
 #define s_printf(args...) do { if (tty) printf("\33[K"); printf(args); } while (0)
 
-#define percent(val1, val2) ((double) val1 / (double) val2 * 100)
+#define percent(val1, val2) \
+	((val2) ? (double) (val1) / (double) (val2) * 100 : 0.0)
 
 void pscan_finish_listing(void)
 {
@@ -105,8 +125,8 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 			tprogress->tid,
 			"checksumming:",
 			tprogress->file_path,
-			pretty_size(tprogress->file_scanned_bytes),
-			pretty_size(tprogress->file_total_bytes),
+			human_size(tprogress->file_scanned_bytes),
+			human_size(tprogress->file_total_bytes),
 			percent(tprogress->file_scanned_bytes, tprogress->file_total_bytes));
 		break;
 	case thread_waiting_lock:
@@ -114,14 +134,23 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 			tprogress->tid,
 			"waiting for lock:",
 			tprogress->file_path,
-			pretty_size(tprogress->file_total_bytes));
+			human_size(tprogress->file_total_bytes));
 		break;
 	case thread_committing:
 		snprintf(buf, BUF_LEN, "[%u] %-20s%s (size: %s)",
 			tprogress->tid,
 			"committing:",
 			tprogress->file_path,
-			pretty_size(tprogress->file_total_bytes));
+			human_size(tprogress->file_total_bytes));
+		break;
+	case thread_deduping:
+		snprintf(buf, BUF_LEN, "[%u] %-20s%s: %s/%s (%05.2f%%)",
+			tprogress->tid,
+			"deduping:",
+			tprogress->file_path,
+			human_size(tprogress->file_scanned_bytes),
+			human_size(tprogress->file_total_bytes),
+			percent(tprogress->file_scanned_bytes, tprogress->file_total_bytes));
 		break;
 	}
 
@@ -129,10 +158,11 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 	s_printf("%.*s\n", w_col, buf);
 }
 
-static void print_total_progress(void)
+static void print_scan_progress(void)
 {
 	uint64_t tf = pscan.total_files_count;
 	uint64_t tb = pscan.total_bytes_count;
+	double elapsed = elapsed_seconds();
 
 	if (!pscan.listing_completed) {
 		/*
@@ -149,10 +179,66 @@ static void print_total_progress(void)
 
 	s_printf("\tFiles scanned: %lu/%lu (%05.2f%%)\n",
 	      files_scanned, tf, tf ? (double)files_scanned / tf * 100 : 100.0);
-	s_printf("\tBytes scanned: %s/%s (%05.2f%%)\n",
-	      pretty_size(bytes_scanned), pretty_size(tb),
+	s_printf("\tBytes scanned: %s/%s (%05.2f%%)",
+	      human_size(bytes_scanned), human_size(tb),
 	      tb ? (double)bytes_scanned / tb * 100 : 100.0);
+	if (bytes_scanned && elapsed > 1.0) {
+		double rate = bytes_scanned / elapsed;
+
+		printf(" · %s/s", human_size((uint64_t)rate));
+		if (bytes_scanned < tb)
+			printf(" · ETA ~%s",
+			       human_duration((tb - bytes_scanned) / rate));
+	}
+	printf("\n");
 	s_printf("\tFile listing: completed\n");
+}
+
+static void print_dedupe_progress(void)
+{
+	uint64_t done = pdd.done;
+	uint64_t queued = pdd.queued;
+	uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
+	uint64_t sd = search_processed, st = search_total;
+	double elapsed = (g_get_monotonic_time() - pdd.start_us) / 1e6;
+	unsigned int pct = 0;
+
+	/*
+	 * The total is fuzzy until the very last batch is queued (and the
+	 * whole-file pass shrinks the extent-group count as it goes), so mark
+	 * it "~" and never claim 100% while the phase is still running.
+	 */
+	if (total) {
+		pct = (unsigned int)(100.0 * done / total);
+		if (pct > 99)
+			pct = 99;
+	}
+
+	s_printf("\tGroups deduped: %lu/~%lu (%u%%)", done, total, pct);
+	if (pdd.batches > 1)
+		printf(" · batch %u/%u", pdd.batch, pdd.batches);
+	printf("\n");
+
+	s_printf("\tSpace reclaimed: %s · kernel verified: %s\n",
+		 human_size(pdd.reclaimed), human_size(pdd.kern));
+
+	s_printf("\tStatus: %s", pdd.activity ? pdd.activity : "working");
+	if (st)
+		printf(" (%lu/%lu files)", sd, st);
+	if (elapsed > 1.0)
+		printf(" · elapsed %s", human_duration(elapsed));
+	if (done > 20 && elapsed > 2.0 && done < total)
+		printf(" · ETA ~%s",
+		       human_duration((total - done) / (done / elapsed)));
+	printf("\n");
+}
+
+static void print_total_progress(void)
+{
+	if (pdd.phase)
+		print_dedupe_progress();
+	else
+		print_scan_progress();
 }
 
 static void prepare_screen_area(void)
@@ -199,10 +285,11 @@ static void *pscan_progress_thread(void * p)
 {
 	struct winsize w;
 	do {
-		/* Refresh the tty properties */
+		/* Refresh the tty properties. Some ttys (e.g. bare ptys)
+		 * report a zero width; treat that as "don't truncate". */
 		if (tty) {
 			ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
-			w_col = w.ws_col;
+			w_col = w.ws_col ? w.ws_col : UINT_MAX;
 		} else {
 			w_col = UINT_MAX;
 		}
@@ -213,11 +300,21 @@ static void *pscan_progress_thread(void * p)
 
 		/* Do not waste too much cpu */
 		usleep(1000 * (tty ? 100 : 1000));
-	} while (!pscan.listing_completed
-		|| files_scanned != pscan.total_files_count
-		|| bytes_scanned != pscan.total_bytes_count);
+	} while (pdd.phase ? pdd.running
+			   : (!pscan.listing_completed
+			      || files_scanned != pscan.total_files_count
+			      || bytes_scanned != pscan.total_bytes_count));
 
 	return NULL;
+}
+
+static void pscan_free_threads(void)
+{
+	for (unsigned int i = 0; i < pscan.thread_count; i++)
+		free(pscan.threads[i]);
+	free(pscan.threads);
+	pscan.threads = NULL;
+	pscan.thread_count = 0;
 }
 
 struct pscan_thread *pscan_register_thread(pid_t tid)
@@ -263,8 +360,7 @@ void pscan_join(void)
 
 	print_total_progress();
 
-	for (unsigned int i = 0; i < pscan.thread_count; i++)
-		free(pscan.threads[i]);
+	pscan_free_threads();
 
 	printer = NULL;
 }
@@ -331,6 +427,113 @@ void pscan_printf(char *fmt, ...)
 	g_mutex_unlock(&pscan.mutex);
 }
 
+/*
+ * Claim a per-thread display slot for one unit of work (a file scan, a dedupe
+ * group). Worker pools churn OS threads (glib reaps idle pool threads and
+ * spawns fresh ones), so slots are claimed per work item and released via
+ * pscan_reset_thread() instead of being tied to the OS thread - dead threads
+ * can't strand "idle" lines and the number of live slots stays bounded by the
+ * pool size instead of growing with thread turnover.
+ */
+struct pscan_thread *pscan_claim_slot(pid_t tid,
+				      enum pscan_thread_status status)
+{
+	struct pscan_thread *slot = NULL;
+
+	g_mutex_lock(&pscan.mutex);
+	for (unsigned int i = 0; i < pscan.thread_count; i++) {
+		if (pscan.threads[i]->status == thread_idle) {
+			slot = pscan.threads[i];
+			slot->tid = tid;
+			slot->status = status;
+			break;
+		}
+	}
+	g_mutex_unlock(&pscan.mutex);
+
+	if (!slot) {
+		slot = pscan_register_thread(tid);
+		slot->status = status;
+	}
+	return slot;
+}
+
+void pdedupe_begin(uint64_t estimated_groups, unsigned int batches)
+{
+	pdd.done = 0;
+	pdd.queued = 0;
+	pdd.reclaimed = 0;
+	pdd.kern = 0;
+	pdd.estimate = estimated_groups;
+	pdd.batches = batches;
+	pdd.batch = batches ? 1 : 0;
+	pdd.activity = "analyzing duplicates";
+	pdd.start_us = g_get_monotonic_time();
+	pdd.phase = true;
+
+	/*
+	 * The live area only makes sense on a tty; under -v the per-group
+	 * notices would fight with the redraws, and -q wants silence. The
+	 * counters above accumulate regardless, for the final summary.
+	 */
+	if (quiet || verbose || !isatty(STDOUT_FILENO))
+		return;
+
+	tty = true;
+	printf("\33[?25l");	/* hide the cursor */
+	prepare_screen_area();
+	pdd.running = 1;
+	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
+}
+
+void pdedupe_end(void)
+{
+	if (pdd.running) {
+		pdd.running = 0;
+		g_thread_join(printer);
+		printer = NULL;
+
+		/* Show the cursor again and clear the status area; the caller
+		 * prints the final summary. */
+		printf("\33[?25h");
+		s_restore_pos();
+		s_clear();
+		s_restore_pos();
+		fflush(stdout);
+	}
+	pscan_free_threads();
+	pdd.phase = false;
+}
+
+void pdedupe_set_batch(unsigned int cur)
+{
+	pdd.batch = cur;
+}
+
+void pdedupe_set_activity(const char *activity)
+{
+	pdd.activity = activity;
+}
+
+void pdedupe_add_queued(uint64_t ngroups)
+{
+	atomic_fetch_add(&pdd.queued, ngroups);
+}
+
+void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t kern_bytes)
+{
+	atomic_fetch_add(&pdd.done, 1);
+	atomic_fetch_add(&pdd.reclaimed, reclaimed_bytes);
+	atomic_fetch_add(&pdd.kern, kern_bytes);
+}
+
+void pdedupe_counters(uint64_t *groups, uint64_t *reclaimed, uint64_t *kern)
+{
+	*groups = pdd.done;
+	*reclaimed = pdd.reclaimed;
+	*kern = pdd.kern;
+}
+
 static void *psearch_progress_thread(void * p)
 {
 	static int last_pos = -1;
@@ -368,11 +571,26 @@ void psearch_run(uint64_t num_filerecs)
 {
 	search_processed = 0;
 	search_total = num_filerecs;
+
+	/*
+	 * During the dedupe phase the search is rendered as a live count on
+	 * the shared status area; the standalone bar is only for runs without
+	 * that area (e.g. print-only mode).
+	 */
+	if (pdd.phase) {
+		pdedupe_set_activity("searching block-level matches");
+		return;
+	}
 	printer = g_thread_new("progress_printer", psearch_progress_thread, NULL);
 }
 
 void psearch_join(void)
 {
+	if (pdd.phase) {
+		search_total = 0;
+		search_processed = 0;
+		return;
+	}
 	g_thread_join(printer);
 	printer = NULL;
 }
