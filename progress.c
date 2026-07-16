@@ -92,7 +92,8 @@ static struct {
 #define s_clear() if (tty) printf("\33[J");
 #define s_printf(args...) do { if (tty) printf("\33[K"); printf(args); } while (0)
 
-#define percent(val1, val2) ((double) val1 / (double) val2 * 100)
+#define percent(val1, val2) \
+	((val2) ? (double) (val1) / (double) (val2) * 100 : 0.0)
 
 void pscan_finish_listing(void)
 {
@@ -124,8 +125,8 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 			tprogress->tid,
 			"checksumming:",
 			tprogress->file_path,
-			pretty_size(tprogress->file_scanned_bytes),
-			pretty_size(tprogress->file_total_bytes),
+			human_size(tprogress->file_scanned_bytes),
+			human_size(tprogress->file_total_bytes),
 			percent(tprogress->file_scanned_bytes, tprogress->file_total_bytes));
 		break;
 	case thread_waiting_lock:
@@ -133,22 +134,22 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 			tprogress->tid,
 			"waiting for lock:",
 			tprogress->file_path,
-			pretty_size(tprogress->file_total_bytes));
+			human_size(tprogress->file_total_bytes));
 		break;
 	case thread_committing:
 		snprintf(buf, BUF_LEN, "[%u] %-20s%s (size: %s)",
 			tprogress->tid,
 			"committing:",
 			tprogress->file_path,
-			pretty_size(tprogress->file_total_bytes));
+			human_size(tprogress->file_total_bytes));
 		break;
 	case thread_deduping:
 		snprintf(buf, BUF_LEN, "[%u] %-20s%s: %s/%s (%05.2f%%)",
 			tprogress->tid,
 			"deduping:",
 			tprogress->file_path,
-			pretty_size(tprogress->file_scanned_bytes),
-			pretty_size(tprogress->file_total_bytes),
+			human_size(tprogress->file_scanned_bytes),
+			human_size(tprogress->file_total_bytes),
 			percent(tprogress->file_scanned_bytes, tprogress->file_total_bytes));
 		break;
 	}
@@ -179,12 +180,12 @@ static void print_scan_progress(void)
 	s_printf("\tFiles scanned: %lu/%lu (%05.2f%%)\n",
 	      files_scanned, tf, tf ? (double)files_scanned / tf * 100 : 100.0);
 	s_printf("\tBytes scanned: %s/%s (%05.2f%%)",
-	      pretty_size(bytes_scanned), pretty_size(tb),
+	      human_size(bytes_scanned), human_size(tb),
 	      tb ? (double)bytes_scanned / tb * 100 : 100.0);
 	if (bytes_scanned && elapsed > 1.0) {
 		double rate = bytes_scanned / elapsed;
 
-		printf(" · %s/s", pretty_size((uint64_t)rate));
+		printf(" · %s/s", human_size((uint64_t)rate));
 		if (bytes_scanned < tb)
 			printf(" · ETA ~%s",
 			       human_duration((tb - bytes_scanned) / rate));
@@ -219,7 +220,7 @@ static void print_dedupe_progress(void)
 	printf("\n");
 
 	s_printf("\tSpace reclaimed: %s · kernel verified: %s\n",
-		 pretty_size(pdd.reclaimed), pretty_size(pdd.kern));
+		 human_size(pdd.reclaimed), human_size(pdd.kern));
 
 	s_printf("\tStatus: %s", pdd.activity ? pdd.activity : "working");
 	if (st)
@@ -427,12 +428,15 @@ void pscan_printf(char *fmt, ...)
 }
 
 /*
- * Claim a per-thread display slot for one dedupe group. Dedupe passes run on
- * short-lived exclusive thread pools (one per pass), so slots are claimed per
- * group and released via pscan_reset_thread() instead of being tied to the OS
- * thread - the number of live slots stays bounded by the pool size.
+ * Claim a per-thread display slot for one unit of work (a file scan, a dedupe
+ * group). Worker pools churn OS threads (glib reaps idle pool threads and
+ * spawns fresh ones), so slots are claimed per work item and released via
+ * pscan_reset_thread() instead of being tied to the OS thread - dead threads
+ * can't strand "idle" lines and the number of live slots stays bounded by the
+ * pool size instead of growing with thread turnover.
  */
-struct pscan_thread *pdedupe_claim_slot(pid_t tid)
+struct pscan_thread *pscan_claim_slot(pid_t tid,
+				      enum pscan_thread_status status)
 {
 	struct pscan_thread *slot = NULL;
 
@@ -441,7 +445,7 @@ struct pscan_thread *pdedupe_claim_slot(pid_t tid)
 		if (pscan.threads[i]->status == thread_idle) {
 			slot = pscan.threads[i];
 			slot->tid = tid;
-			slot->status = thread_deduping;
+			slot->status = status;
 			break;
 		}
 	}
@@ -449,7 +453,7 @@ struct pscan_thread *pdedupe_claim_slot(pid_t tid)
 
 	if (!slot) {
 		slot = pscan_register_thread(tid);
-		slot->status = thread_deduping;
+		slot->status = status;
 	}
 	return slot;
 }

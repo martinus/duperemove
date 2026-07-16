@@ -111,11 +111,14 @@ void pdedupe_add_queued(uint64_t ngroups);
 void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t kern_bytes);
 
 /*
- * Claim a per-thread display line for one dedupe group; fill in file_path /
- * file_total_bytes / file_scanned_bytes like a scan thread would. Release it
- * with pscan_reset_thread().
+ * Claim a per-thread display line for one unit of work (file scan / dedupe
+ * group) and mark it with `status`; fill in file_path / file_total_bytes /
+ * file_scanned_bytes afterwards. Release it with pscan_reset_thread(). Claim
+ * per work item, not per OS thread: pool threads get reaped and respawned,
+ * which would strand dead threads' lines and grow the display unboundedly.
  */
-struct pscan_thread *pdedupe_claim_slot(pid_t tid);
+struct pscan_thread *pscan_claim_slot(pid_t tid,
+				      enum pscan_thread_status status);
 
 /* Read back the accumulated totals (for the end-of-run summary). */
 void pdedupe_counters(uint64_t *groups, uint64_t *reclaimed, uint64_t *kern);

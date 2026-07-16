@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 
 #include <glib.h>
 
@@ -92,6 +93,15 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 	}
 }
 
+/*
+ * Per-destination failures, tallied across the whole phase. A single bad
+ * group can have a hundred failing destinations; printing one line each
+ * floods the console, so the default view is one aggregate line in the final
+ * summary and the per-file detail moved behind -v.
+ */
+static _Atomic uint64_t dedupe_dest_differs;
+static _Atomic uint64_t dedupe_dest_errors;
+
 static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 				   uint64_t *kern_bytes)
 {
@@ -108,7 +118,7 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 			*kern_bytes += target_bytes;
 
 		/*
-		 * Only print in case of error.
+		 * Only report errors.
 		 *
 		 * Kernels older than 4.2 can't handle the target and
 		 * dedupe files being the same and -EINVAL in that
@@ -119,14 +129,18 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 		    (target_status == -EINVAL && f == ctxt->ioctl_file))
 			continue;
 
-		if (target_status == FILE_DEDUPE_RANGE_DIFFERS)
+		if (target_status == FILE_DEDUPE_RANGE_DIFFERS) {
 			status_str = "data changed";
-		else if (target_status < 0)
-			status_str = strerror(-target_status);
-		printf("[%p] Dedupe for file \"%s\" had status (%d) "
-		       "\"%s\".\n",
-		       g_thread_self(), f->filename, target_status,
-		       status_str);
+			atomic_fetch_add(&dedupe_dest_differs, 1);
+		} else {
+			if (target_status < 0)
+				status_str = strerror(-target_status);
+			atomic_fetch_add(&dedupe_dest_errors, 1);
+		}
+		vprintf("[%p] Dedupe for file \"%s\" had status (%d) "
+			"\"%s\".\n",
+			g_thread_self(), f->filename, target_status,
+			status_str);
 	}
 }
 
@@ -597,7 +611,7 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	uint64_t kern_bytes = 0ULL;
 	struct dupe_extents *dext = priv;
 	_cleanup_(pscan_reset_thread) struct pscan_thread *slot =
-						pdedupe_claim_slot(gettid());
+				pscan_claim_slot(gettid(), thread_deduping);
 
 	/*
 	 * Seed the display line from the group before any work: first member
@@ -685,6 +699,12 @@ void dedupe_end(void)
 			printf("  %sElapsed%s        %.1fs\n",
 			       col_dim, col_reset, elapsed_seconds());
 		}
+		if (dedupe_dest_differs || dedupe_dest_errors)
+			printf("  %sNot deduped%s    %lu changed since scan, "
+			       "%lu failed (rerun with -v for detail)\n",
+			       col_dim, col_reset,
+			       (uint64_t)dedupe_dest_differs,
+			       (uint64_t)dedupe_dest_errors);
 	}
 
 	/*

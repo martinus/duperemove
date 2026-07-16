@@ -1448,10 +1448,9 @@ static void csum_whole_file(struct file_to_scan *file)
 	 */
 	struct dbhandle *db = scan_writer;
 	static __thread struct buffer buffer = {0,};
-	static __thread struct pscan_thread *tls_progress = NULL;
 
 	/* Dummy variables used to trigger the cleanup code */
-	_cleanup_(pscan_reset_thread) struct pscan_thread *tprogress = tls_progress;
+	_cleanup_(pscan_reset_thread) struct pscan_thread *tprogress = NULL;
 	_cleanup_(freep) char *path = file->path;
 	_cleanup_(freep) struct file_to_scan *clean_file = file;
 
@@ -1480,13 +1479,10 @@ static void csum_whole_file(struct file_to_scan *file)
 		return;
 	}
 
-	if (!tls_progress) {
-		tls_progress = pscan_register_thread(gettid());
-		abort_on(!tls_progress);
-		tprogress = tls_progress;
-	}
+	/* Claimed per file, not per thread: see pscan_claim_slot(). */
+	tprogress = pscan_claim_slot(gettid(), thread_scanning);
+	abort_on(!tprogress);
 
-	tprogress->status = thread_scanning;
 	tprogress->file_scanned_bytes = 0;
 	tprogress->file_total_bytes = file->filesize;
 	strncpy(tprogress->file_path, file->path, PATH_MAX);
