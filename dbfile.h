@@ -170,6 +170,17 @@ int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 			   unsigned int seq_lo, unsigned int seq_hi);
 
+struct fiemap;
+struct extent_csum;
+/*
+ * #386 prototype: reuse an already-hashed byte-identical file's digests instead
+ * of reading. Returns 1 and fills extents/num_extents/digest_out on a hit, else
+ * 0. See dbfile.c for correctness notes.
+ */
+int dbfile_reuse_file_hashes(struct dbhandle *db, struct fiemap *fiemap,
+			     uint64_t filesize, struct extent_csum *extents,
+			     unsigned int *num_extents, unsigned char *digest_out);
+
 int dbfile_rename_file(struct dbhandle *db, int64_t fileid, char *path);
 
 static inline void sqlite3_stmt_cleanup(void *p)

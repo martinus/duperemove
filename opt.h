@@ -28,6 +28,7 @@ struct options {
 	bool dedupe_same_file : 1;
 	unsigned int batch_size;
 	bool fdupes_mode : 1;
+	bool reuse_checksums : 1;  /* #386 prototype: reuse extent digests by poff */
 	char *hashfile;
 	uint64_t min_filesize;	/* skip regular files smaller than this */
 };

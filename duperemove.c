@@ -210,6 +210,7 @@ enum {
 	BATCH_SIZE_OPTION,
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
+	REUSE_CHECKSUMS_OPTION,
 };
 
 static int process_fdupes(void)
@@ -324,6 +325,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
+		{ "reuse-checksums", 0, NULL, REUSE_CHECKSUMS_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -421,6 +423,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 				eprintf("Error: --min-filesize must be greater than zero\n");
 				return EINVAL;
 			}
+			break;
+		case REUSE_CHECKSUMS_OPTION:
+			options.reuse_checksums = true;
 			break;
 		case EXCLUDE_OPTION:
 			if (add_exclude_pattern(optarg))
@@ -703,6 +708,8 @@ static int scan_files(int argc, char **argv, int filelist_idx, struct dbhandle *
 	filescan_free();
 	if (!quiet)
 		pscan_join();
+
+	filescan_print_reuse_stats();
 
 	if (ret)
 		return ret;

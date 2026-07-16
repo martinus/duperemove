@@ -24,5 +24,6 @@ struct options options = {
 	.dedupe_same_file = true,
 	.batch_size = 1024,
 	.fdupes_mode = false,
+	.reuse_checksums = false,
 	.min_filesize = 1,	/* default: only skip empty files */
 };

@@ -18,6 +18,7 @@
 #include "hash-tree.h"
 #include "results-tree.h"
 #include "file_scan.h"
+#include "fiemap.h"
 #include "debug.h"
 
 #include "dbfile.h"
@@ -245,6 +246,21 @@ static int create_indexes(sqlite3 *db)
 	ret = sqlite3_exec(db, CREATE_FILES_DEDUPESEQ_INDEX, NULL, NULL, NULL);
 	if (ret)
 		goto out;
+
+	/*
+	 * #386 prototype: --reuse-checksums needs to find an already-hashed
+	 * extent by its physical location during the scan, so this index must be
+	 * maintained from the start (it costs an extra index update per extent
+	 * insert - that overhead is part of what the A/B measures). Only built
+	 * when the option is on, so a normal run pays nothing.
+	 */
+	if (options.reuse_checksums) {
+		ret = sqlite3_exec(db,
+			"create index if not exists idx_extents_poff on extents(poff, len);",
+			NULL, NULL, NULL);
+		if (ret)
+			goto out;
+	}
 
 out:
 	if (ret)
@@ -1601,6 +1617,101 @@ out:
 	if (!options.hashfile)
 		dbfile_unlock();
 	return ret;
+}
+
+/*
+ * #386 prototype. If some already-hashed file is byte-identical to the one
+ * described by `fiemap`/`filesize` - same size and the same physical extent at
+ * every logical offset - fill `extents` with that file's stored per-extent
+ * digests and `digest_out` with its whole-file digest, and return 1, so the
+ * caller can skip reading and re-hashing the data. Returns 0 when no identical
+ * file is known (caller hashes normally).
+ *
+ * Correctness: equal (loff, poff, len) for every extent plus equal size means
+ * both files reference the same on-disk bytes, so the stored digests are valid
+ * for this file too. Prototype limitations: per-call prepared statements and a
+ * held write lock (see caller); a production version would cache the statements
+ * and read through a per-thread handle. `poff` reuse across runs assumes the
+ * physical address still holds the same data (true for live btrfs extents; the
+ * dedupe ioctl byte-verifies regardless).
+ */
+int dbfile_reuse_file_hashes(struct dbhandle *db, struct fiemap *fiemap,
+			     uint64_t filesize, struct extent_csum *extents,
+			     unsigned int *num_extents, unsigned char *digest_out)
+{
+	unsigned int n = fiemap->fm_mapped_extents;
+	sqlite3_stmt *cand = NULL, *fi = NULL, *ex = NULL;
+	int found = 0;
+
+	if (n == 0)
+		return 0;
+
+	if (sqlite3_prepare_v2(db->db,
+		"select fileid from extents where poff = ?1 and len = ?2 limit 16",
+		-1, &cand, NULL) ||
+	    sqlite3_prepare_v2(db->db,
+		"select size, digest from files where id = ?1 and digest is not null",
+		-1, &fi, NULL) ||
+	    sqlite3_prepare_v2(db->db,
+		"select loff, poff, len, digest from extents where fileid = ?1 "
+		"order by loff", -1, &ex, NULL))
+		goto out;
+
+	sqlite3_bind_int64(cand, 1, fiemap->fm_extents[0].fe_physical);
+	sqlite3_bind_int64(cand, 2, fiemap->fm_extents[0].fe_length);
+
+	while (!found && sqlite3_step(cand) == SQLITE_ROW) {
+		int64_t fileid = sqlite3_column_int64(cand, 0);
+		unsigned char cand_digest[DIGEST_LEN];
+		const void *blob;
+		unsigned int i = 0;
+		int mismatch = 0;
+
+		sqlite3_reset(fi);
+		sqlite3_bind_int64(fi, 1, fileid);
+		if (sqlite3_step(fi) != SQLITE_ROW)
+			continue;
+		if ((uint64_t)sqlite3_column_int64(fi, 0) != filesize)
+			continue;
+		blob = sqlite3_column_blob(fi, 1);
+		if (!blob || sqlite3_column_bytes(fi, 1) != DIGEST_LEN)
+			continue;
+		memcpy(cand_digest, blob, DIGEST_LEN);
+
+		sqlite3_reset(ex);
+		sqlite3_bind_int64(ex, 1, fileid);
+		while (sqlite3_step(ex) == SQLITE_ROW) {
+			struct fiemap_extent *fe = &fiemap->fm_extents[i];
+
+			if (i >= n ||
+			    (uint64_t)sqlite3_column_int64(ex, 0) != fe->fe_logical ||
+			    (uint64_t)sqlite3_column_int64(ex, 1) != fe->fe_physical ||
+			    (uint64_t)sqlite3_column_int64(ex, 2) != fe->fe_length) {
+				mismatch = 1;
+				break;
+			}
+			blob = sqlite3_column_blob(ex, 3);
+			if (!blob || sqlite3_column_bytes(ex, 3) != DIGEST_LEN) {
+				mismatch = 1;
+				break;
+			}
+			extents[i].loff = fe->fe_logical;
+			extents[i].poff = fe->fe_physical;
+			extents[i].len = fe->fe_length;
+			memcpy(extents[i].digest, blob, DIGEST_LEN);
+			i++;
+		}
+		if (!mismatch && i == n) {
+			memcpy(digest_out, cand_digest, DIGEST_LEN);
+			*num_extents = n;
+			found = 1;
+		}
+	}
+out:
+	sqlite3_finalize(cand);
+	sqlite3_finalize(fi);
+	sqlite3_finalize(ex);
+	return found;
 }
 
 int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,

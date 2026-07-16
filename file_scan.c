@@ -55,6 +55,24 @@
 #include "util.h"
 #include "opt.h"
 #include "threads.h"
+
+#include <stdatomic.h>
+
+/* #386 prototype: how much reading the --reuse-checksums path avoided. */
+static _Atomic uint64_t reuse_files_total;
+static _Atomic uint64_t reuse_bytes_total;
+static void reuse_add(uint64_t bytes)
+{
+	atomic_fetch_add(&reuse_files_total, 1);
+	atomic_fetch_add(&reuse_bytes_total, bytes);
+}
+void filescan_print_reuse_stats(void)
+{
+	if (options.reuse_checksums)
+		qprintf("Checksum reuse: %lu files, %s not re-read\n",
+			(uint64_t)reuse_files_total,
+			pretty_size(reuse_bytes_total));
+}
 #include "fiemap.h"
 #include "progress.h"
 
@@ -1520,6 +1538,33 @@ static void csum_whole_file(struct file_to_scan *file)
 	}
 
 	/*
+	 * #386 prototype: if this file is byte-identical to one we've already
+	 * hashed (same physical extents - snapshots, reflinks, prior dedupe),
+	 * reuse the stored digests instead of reading and re-hashing the data.
+	 * Gated on --reuse-checksums and the default extent path (block hashes
+	 * for --dedupe-options=partial are not reused). The lookup runs under
+	 * the write lock (the scan workers share one connection); the win is
+	 * that the expensive read below is then skipped entirely.
+	 */
+	bool reused = false;
+	if (options.reuse_checksums && !options.do_block_hash) {
+		dbfile_lock();
+		reused = dbfile_reuse_file_hashes(db, ctxt.fiemap, ctxt.filesize,
+						  hashes.extents,
+						  &hashes.extents_index,
+						  file_digest);
+		dbfile_unlock();
+		if (reused) {
+			finish_running_checksum(ctxt.file_csum, NULL);
+			ctxt.file_csum = NULL;
+			ctxt.off = ctxt.filesize;
+			tprogress->file_scanned_bytes += ctxt.filesize;
+			tprogress->total_scanned_bytes += ctxt.filesize;
+			reuse_add(ctxt.filesize);
+		}
+	}
+
+	/*
 	 * Main loop:
 	 * - grab some data into the buffer
 	 * - try to process as must entire blocks as possible
@@ -1528,7 +1573,7 @@ static void csum_whole_file(struct file_to_scan *file)
 	 * loop again until pread returns 0 or
 	 * until we reach the expected EOF, based on the expected filesize
 	 */
-	while (ctxt.off < ctxt.filesize) {
+	while (!reused && ctxt.off < ctxt.filesize) {
 		/* In the buffer, how much bytes are processed as blocks
 		 * Extents processing and file processing will not consumme
 		 * more than that amount of bytes
@@ -1593,8 +1638,10 @@ static void csum_whole_file(struct file_to_scan *file)
 		return;
 	}
 
-	finish_running_checksum(ctxt.file_csum, file_digest);
-	ctxt.file_csum = NULL;
+	if (!reused) {
+		finish_running_checksum(ctxt.file_csum, file_digest);
+		ctxt.file_csum = NULL;
+	}
 
 	/*
 	 * We've read the whole file once and won't touch it again this scan.

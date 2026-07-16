@@ -59,5 +59,8 @@ int add_exclude_pattern(const char *pattern);
 void filescan_init(void);
 void filescan_free(void);
 
+/* #386 prototype: print how much reading --reuse-checksums avoided. */
+void filescan_print_reuse_stats(void);
+
 void add_file_fdupes(char *path);
 #endif	/* __FILE_SCAN_H__ */
