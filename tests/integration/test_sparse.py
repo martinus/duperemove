@@ -1,7 +1,7 @@
 """Sparse files, holes, unaligned tails, and empty/zero files."""
 
 import os
-from harness import DuperemoveTest
+from harness import DuperemoveTest, requires_reflink
 
 
 class SparseTest(DuperemoveTest):
@@ -33,6 +33,35 @@ class SparseTest(DuperemoveTest):
         self.assertEqual(
             1, self.hf_scalar("select count(*) from files where filename like '%/data'"),
             "non-empty file recorded")
+
+    def test_trailing_hole_scans(self):
+        # A file whose last extent ends before EOF (data then a big hole).
+        # FIEMAP omits the hole, so walking extents past the last one used to
+        # error ("unable to get extent") and abandon the file (upstream #374).
+        self.make_trailing_hole("tree/th", os.urandom(200000), 4 * 1024 * 1024)
+        self.scan(self.path("tree"))
+        self.assertDmOk()
+        self.assertNotIn("unable to get extent", self.out)
+        self.assertNotIn("changed", self.out)
+        self.assertEqual(1, self.hf_count("files"), "trailing-hole file recorded")
+        self.assertEqual(
+            0, self.hf_scalar("select count(*) from files where digest is null"),
+            "trailing-hole file digested (not abandoned)")
+
+    @requires_reflink
+    def test_trailing_hole_dedupes_and_preserves_data(self):
+        data = os.urandom(240000)
+        a = self.make_trailing_hole("tree/a", data, 8 * 1024 * 1024)
+        b = self.make_trailing_hole("tree/b", data, 8 * 1024 * 1024)
+        self.sync()
+        before = open(a, "rb").read()
+
+        self.dedupe(self.path("tree"))
+        self.assertDmOk()
+        self.sync()
+
+        self.assertShared(a, b, "identical trailing-hole files dedupe")
+        self.assertEqual(before, open(a, "rb").read(), "data intact after dedupe")
 
     def test_unaligned_sizes(self):
         self.mkrand("tree/a", 131072 + 1)

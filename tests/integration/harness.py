@@ -308,6 +308,12 @@ class DuperemoveTest(unittest.TestCase):
             f.write(tail)
         return p
 
+    def make_trailing_hole(self, relpath, data, size):
+        """Write `data`, then extend the file to `size` so it ends in a hole."""
+        p = self.write(relpath, data)
+        os.truncate(p, size)
+        return p
+
     def hardlink(self, rel_src, rel_dst):
         dst = self.path(rel_dst)
         os.link(self.path(rel_src), dst)
