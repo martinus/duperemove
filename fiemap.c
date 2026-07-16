@@ -207,3 +207,43 @@ int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shar
 	}
 	return 0;
 }
+
+/* Extents whose fe_physical is not a real, stable on-disk location. */
+#define FIEMAP_NO_PHYS (FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
+			FIEMAP_EXTENT_DATA_INLINE)
+
+bool fiemap_range_shared_with(const struct fiemap *tgt, uint64_t tgt_off,
+			      int dest_fd, uint64_t dest_off, uint64_t len)
+{
+	_cleanup_(freep) struct fiemap *dm = NULL;
+
+	if (len == 0 || !tgt || tgt->fm_mapped_extents == 0)
+		return false;
+
+	dm = do_fiemap_range(dest_fd, dest_off, len);
+	/* NULL means an error or a hole-only range; treat as "not known shared". */
+	if (!dm || dm->fm_mapped_extents != tgt->fm_mapped_extents)
+		return false;
+
+	/*
+	 * The ranges share all storage iff their extent maps are identical:
+	 * same count, and every extent at the same position in the range points
+	 * at the same physical offset for the same length. On btrfs a physical
+	 * offset uniquely identifies a stored extent, so equal fe_physical means
+	 * the same on-disk data - deduping would change nothing. Extents with no
+	 * real physical location (delalloc/unknown/inline) all report
+	 * fe_physical 0, so they must never be treated as "shared".
+	 */
+	for (unsigned int i = 0; i < tgt->fm_mapped_extents; i++) {
+		const struct fiemap_extent *ea = &tgt->fm_extents[i];
+		const struct fiemap_extent *eb = &dm->fm_extents[i];
+
+		if ((ea->fe_flags | eb->fe_flags) & FIEMAP_NO_PHYS)
+			return false;
+		if (ea->fe_physical != eb->fe_physical ||
+		    ea->fe_length != eb->fe_length ||
+		    (ea->fe_logical - tgt_off) != (eb->fe_logical - dest_off))
+			return false;
+	}
+	return true;
+}

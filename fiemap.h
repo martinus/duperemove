@@ -4,6 +4,7 @@
 #include <linux/fiemap.h>
 #include <sys/types.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /*
  * Given a filled fiemap structure, extract the struct fiemap_extent
@@ -43,6 +44,20 @@ int fiemap_first_extent_poff(int fd, uint64_t start, uint64_t length,
  * Count how much of the area between start_off and end_off is shared.
  */
 int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shared);
+
+/*
+ * True if [dest_off, dest_off+len) on dest_fd already maps to the exact same
+ * physical extents as the precomputed target map `tgt` (which describes
+ * [tgt_off, tgt_off+len)) - i.e. the two ranges share all their storage, so
+ * deduping them would be a byte-for-byte no-op. The target is passed as an
+ * already-fetched map so a caller comparing one target against many
+ * destinations fiemaps the target only once. Conservative: returns false on
+ * any fiemap failure, any difference, or any extent without a real physical
+ * location, so a caller only ever skips a genuine no-op, never a real dedupe.
+ * Get `tgt` from do_fiemap_range(tgt_fd, tgt_off, len).
+ */
+bool fiemap_range_shared_with(const struct fiemap *tgt, uint64_t tgt_off,
+			      int dest_fd, uint64_t dest_off, uint64_t len);
 
 /*
  * Number of physical extents overlapping [start, start+length), via a single
