@@ -387,6 +387,13 @@ static int dbfile_set_modes(sqlite3 *db)
 	return ret;
 }
 
+/*
+ * Set when this run built the hashfile from scratch - a brand-new file or one
+ * recreated after a failed check. Such a file is written at insert density with
+ * no freelist, so dbfile_maybe_vacuum() forces a one-off compaction for it.
+ */
+static bool hashfile_rebuilt;
+
 static int dbfile_prepare(sqlite3 *db)
 {
 	struct dbfile_config cfg;
@@ -422,8 +429,10 @@ static int dbfile_prepare(sqlite3 *db)
 	 * strict application_id check below. An existing file must already carry
 	 * the brand or dbfile_check() rejects it and we recreate it fresh.
 	 */
-	if (dbfile_config_empty(db))
+	if (dbfile_config_empty(db)) {
 		dbfile_stamp_application_id(db);
+		hashfile_rebuilt = true;
+	}
 
 	ret = dbfile_get_config(db, &cfg);
 	if (ret) {
@@ -1021,6 +1030,10 @@ static int dbfile_pragma_uint64(sqlite3 *db, const char *pragma, uint64_t *out)
  * nothing. It only fills up after a large prune (e.g. many deleted files
  * removed from the hashfile), which is exactly when the rewrite pays off. So
  * VACUUM only when a meaningful fraction of the file is actually free.
+ *
+ * The exception is a from-scratch build (hashfile_rebuilt): it has no freelist,
+ * but its pages sit at insert density - the random-key path_hash/digest indexes
+ * fill to only ~2/3 - so a one-off VACUUM meaningfully compacts it.
  */
 #define VACUUM_FREE_PCT		25
 
@@ -1033,11 +1046,16 @@ void dbfile_maybe_vacuum(struct dbhandle *db)
 	    dbfile_pragma_uint64(db->db, "PRAGMA page_count", &total))
 		return;
 
-	if (total == 0 || freelist * 100 < total * VACUUM_FREE_PCT)
+	if (!hashfile_rebuilt &&
+	    (total == 0 || freelist * 100 < total * VACUUM_FREE_PCT))
 		return;
 
-	vprintf("Vacuuming hashfile: %"PRIu64" of %"PRIu64" pages free\n",
-		freelist, total);
+	if (hashfile_rebuilt) {
+		qprintf("Compacting the rebuilt hashfile ...\n");
+	} else {
+		vprintf("Vacuuming hashfile: %"PRIu64" of %"PRIu64" pages free\n",
+			freelist, total);
+	}
 
 	/* Maintenance only: a failure here must not fail the run. */
 	ret = sqlite3_exec(db->db, "VACUUM", NULL, NULL, NULL);
