@@ -196,6 +196,23 @@ The \f[CR]reclaimable_logical_bytes\f[R] field is a logical upper bound;
 the real disk space freed is smaller on a compressed filesystem.
 Requires the \f[CR]\-\-hashfile\f[R] option.
 .TP
+\f[B]\-\-autotune\f[R] \f[CR]files/dirs ..\f[R]
+Measure the fastest \f[CR]\-\-io\-threads\f[R] for this machine and exit.
+oans reads and hashes a bounded sample of the given tree at several thread
+counts, dropping the page cache between trials (run as root for meaningful
+cold\-read numbers on spinning disks), and prints a throughput table with the
+best value.
+When \f[CR]\-\-hashfile\f[R] is given the winner is stored in that hashfile, so
+later runs against it use that thread count automatically unless you pass an
+explicit \f[CR]\-\-io\-threads\f[R].
+This is the hardware\-measured counterpart to the automatic storage heuristic
+(see \f[CR]\-\-io\-threads\f[R]); it is the reliable way to find the optimum for
+a NAS or multi\-disk array.
+The sample bounds can be tuned with the
+\f[CR]DUPEREMOVE_AUTOTUNE_MAX_FILES\f[R],
+\f[CR]DUPEREMOVE_AUTOTUNE_MAX_BYTES\f[R] and
+\f[CR]DUPEREMOVE_AUTOTUNE_ROUNDS\f[R] environment variables.
+.TP
 \f[B]\-R\f[R] \f[CR]files ..\f[R]
 Remove file from the db and exit.
 oans will read the list from standard input if a hyphen (\-) is

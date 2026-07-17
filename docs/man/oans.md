@@ -179,6 +179,19 @@ lifetime run-history totals, then exit. Intended for scripting and dashboards
 `reclaimable_logical_bytes` field is a logical upper bound; the real disk space
 freed is smaller on a compressed filesystem. Requires the `--hashfile` option.
 
+**\--autotune** `files/dirs ..`
+  ~ Measure the fastest `--io-threads` for this machine and exit. oans reads
+and hashes a bounded sample of the given tree at several thread counts,
+dropping the page cache between trials (run as root for meaningful cold-read
+numbers on spinning disks), and prints a throughput table with the best value.
+When `--hashfile` is given the winner is stored in that hashfile, so later runs
+against it use that thread count automatically unless you pass an explicit
+`--io-threads`. This is the hardware-measured counterpart to the automatic
+storage heuristic (see `--io-threads`); it is the reliable way to find the
+optimum for a NAS or multi-disk array. The sample bounds can be tuned with the
+`DUPEREMOVE_AUTOTUNE_MAX_FILES`, `DUPEREMOVE_AUTOTUNE_MAX_BYTES` and
+`DUPEREMOVE_AUTOTUNE_ROUNDS` environment variables.
+
 **-R** `files ..`
   ~ Remove file from the db and exit. oans will read the list from
 standard input if a hyphen (-) is provided. Requires the `--hashfile` option.

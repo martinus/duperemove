@@ -101,6 +101,14 @@ int __dbfile_sync_config(sqlite3 *db, struct dbfile_config *cfg);
 int dbfile_sync_config(struct dbhandle *db, struct dbfile_config *cfg);
 
 /*
+ * Store/read a single integer under `key` in the config key/value table (used
+ * for the persisted --autotune result). set returns 0 on success; get returns
+ * 1 and sets *val if the key was present, 0 if absent, <0 on error.
+ */
+int dbfile_set_config_int(struct dbhandle *db, const char *key, int64_t val);
+int dbfile_get_config_int(struct dbhandle *db, const char *key, int64_t *val);
+
+/*
  * Self-describing hashfile: the scan-shaping options plus the roots and
  * user exclude patterns of a run, so `oans --hashfile=X` (no file arguments)
  * can replay the last run. Ephemeral knobs (threads, verbosity, colour,

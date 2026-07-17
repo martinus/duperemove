@@ -47,6 +47,7 @@
 #include "find_dupes.h"
 #include "run_dedupe.h"
 #include "storage.h"
+#include "autotune.h"
 
 #include "opt.h"
 
@@ -58,6 +59,7 @@ static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
 static unsigned int history_only_opt = 0;
 static unsigned int json_only_opt = 0;
+static unsigned int autotune_opt = 0;
 static int opt_no_color = 0;
 
 /* User-supplied --exclude patterns, captured for the self-describing hashfile
@@ -625,6 +627,7 @@ enum {
 	STATS_OPTION,
 	HISTORY_OPTION,
 	JSON_OPTION,
+	AUTOTUNE_OPTION,
 };
 
 static int add_one_stdin_file(char *path, void *db)
@@ -691,6 +694,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "stats", 0, NULL, STATS_OPTION },
 		{ "history", 0, NULL, HISTORY_OPTION },
 		{ "json", 0, NULL, JSON_OPTION },
+		{ "autotune", 0, NULL, AUTOTUNE_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -772,6 +776,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case JSON_OPTION:
 			json_only_opt = 1;
 			break;
+		case AUTOTUNE_OPTION:
+			autotune_opt = 1;
+			break;
 		case QUIET_OPTION:
 		case 'q':
 			quiet = 1;
@@ -836,15 +843,24 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	/* -L/-R/--stats/--history/--json are exclusive read-only report modes. */
+	/* -L/-R/--stats/--history/--json are exclusive read-only report modes;
+	 * --autotune is exclusive with them too. */
 	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
 				  + history_only_opt + json_only_opt;
 	/* Every report mode but -R takes no file list. */
 	bool nofile_report = report_count && !rm_only_opt;
 
-	if (report_count > 1) {
+	if (report_count + autotune_opt > 1) {
 		eprintf("Error: use only one of '-L', '-R', '--stats', "
-			"'--history', '--json'.\n");
+			"'--history', '--json', '--autotune'.\n");
+		return 1;
+	}
+
+	/* --autotune measures a live tree, so it needs a file list (the hashfile
+	 * is optional - it is only used to persist the result). */
+	if (autotune_opt && numfiles == 0) {
+		eprintf("Error: --autotune needs a file or directory to "
+			"measure against.\n");
 		return 1;
 	}
 
@@ -1173,14 +1189,25 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
  * A user-supplied --io-threads is always respected. `--autotune` measures the
  * real optimum; this only picks a sensible starting point with no extra I/O.
  */
-static void auto_tune_io_threads(const char *root)
+static void auto_tune_io_threads(struct dbhandle *db, const char *root)
 {
 	struct storage_profile p;
 	char desc[96];
+	int64_t stored;
 	unsigned int rec;
 
 	if (options.io_threads_set || !root)
 		return;
+
+	/* A prior --autotune result stored in the hashfile wins over the guess. */
+	if (db && dbfile_get_config_int(db, AUTOTUNE_CONFIG_KEY, &stored) == 1 &&
+	    stored > 0) {
+		options.io_threads = (unsigned int)stored;
+		vprintf("Using autotuned --io-threads=%u from the hashfile "
+			"(override to change, re-run --autotune to update)\n",
+			options.io_threads);
+		return;
+	}
 
 	if (storage_detect(root, &p) != 0)
 		return;	/* keep the CPU-count default set in main() */
@@ -1250,6 +1277,8 @@ int main(int argc, char **argv)
 		return print_hashfile_history(options.hashfile);
 	else if (json_only_opt)
 		return print_metrics_json(options.hashfile);
+	else if (autotune_opt)
+		return autotune_run(&argv[filelist_idx], argc - filelist_idx);
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)
@@ -1299,7 +1328,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Pick io-threads to suit the target's storage (unless set explicitly). */
-	auto_tune_io_threads(roots[0]);
+	auto_tune_io_threads(db, roots[0]);
 
 	print_header();
 
