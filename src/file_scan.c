@@ -830,7 +830,14 @@ static void process_dir(const char *path, struct dbhandle *db)
 
 		strcpy(child + dirlen, entry->d_name);
 
-		if (statx(0, child, 0, STATX_BASIC_STATS, &st) ||
+		/*
+		 * Stat relative to the open directory fd, not via the absolute
+		 * `child` path: the kernel then resolves only the single leaf
+		 * name instead of walking every path component from / on each
+		 * file (link_path_walk dominated the warm-rescan profile). We
+		 * still build `child` for the DB (paths are stored absolute).
+		 */
+		if (statx(dirfd(dirp), entry->d_name, 0, STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS)) {
 			eprintf("Failed to stat %s: %s\n", child, strerror(errno));
 			continue;
