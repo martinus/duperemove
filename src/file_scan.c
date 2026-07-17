@@ -1725,8 +1725,10 @@ static GHashTable *seen_inodes;
  * hint: a missed id just gets stat()d by the prune (still correct), and a set
  * bit always means the file was seen this run, so it can never cause a live
  * file to be pruned. Populated on the single __scan_file() consumer, so no
- * locking. Outlives filescan_free() because the prune runs after scan_files();
- * cleared by filescan_seen_reset().
+ * locking. It deliberately outlives filescan_free(): the prune writes to the
+ * hashfile, so it has to run after the batched scan writer has committed and
+ * released the WAL write lock (i.e. after filescan_free()), and it reads this
+ * set. filescan_prune_deleted() consumes and frees it.
  */
 static uint64_t *seen_files;
 static size_t seen_files_nwords;
@@ -1739,7 +1741,7 @@ static void mark_file_seen(int64_t id)
 		return;
 	word = (size_t)id / 64;
 	if (word >= seen_files_nwords) {
-		size_t ncap = seen_files_nwords ? seen_files_nwords * 2 : 1024;
+		size_t ncap = seen_files_nwords ? seen_files_nwords : 1024;
 		uint64_t *tmp;
 
 		while (ncap <= word)
@@ -1755,7 +1757,7 @@ static void mark_file_seen(int64_t id)
 	seen_files[word] |= (uint64_t)1 << ((size_t)id % 64);
 }
 
-bool filescan_file_was_seen(int64_t id)
+static bool file_was_seen(int64_t id)
 {
 	size_t word = (size_t)id / 64;
 
@@ -1764,11 +1766,20 @@ bool filescan_file_was_seen(int64_t id)
 	return (seen_files[word] >> ((size_t)id % 64)) & 1;
 }
 
-void filescan_seen_reset(void)
+/*
+ * Remove hashfile rows for files deleted from disk since the last scan, using
+ * the walk's seen-set to skip re-stat()ing files it already confirmed. Call
+ * after scan_files() has returned (the scan writer must be committed first).
+ * Returns the number pruned, or -1 on error. Frees the seen-set.
+ */
+int64_t filescan_prune_deleted(struct dbhandle *db)
 {
+	int64_t pruned = dbfile_prune_missing_files(db, file_was_seen);
+
 	free(seen_files);
 	seen_files = NULL;
 	seen_files_nwords = 0;
+	return pruned;
 }
 
 struct ino_key {
@@ -1815,7 +1826,6 @@ static void mark_inode_seen(uint64_t ino, uint64_t subvol)
 
 void filescan_init(void)
 {
-	filescan_seen_reset();	/* start each walk with an empty seen-set */
 	abort_on(scan_pool.pool);
 	abort_on(scan_writer_open());
 	seen_inodes = g_hash_table_new_full(ino_key_hash, ino_key_equal,

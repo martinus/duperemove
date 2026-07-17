@@ -1795,9 +1795,9 @@ uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only)
  * whose digest is still NULL. This happens when a previous run was interrupted
  * (e.g. ctrl^C) after inserting a file record but before storing its hashes.
  *
- * Note this does NOT remove entries for files deleted from disk: those keep a
- * valid digest and are simply never revisited by the scan. Use -R to drop
- * specific paths from the hashfile.
+ * Files deleted from disk are handled separately by
+ * dbfile_prune_missing_files() (they keep a valid digest, so they are not
+ * caught here).
  */
 int dbfile_prune_unscanned_files(struct dbhandle *db)
 {
@@ -1823,9 +1823,10 @@ int dbfile_prune_unscanned_files(struct dbhandle *db)
  * ON DELETE CASCADE foreign key. Returns the number of files pruned, or -1 on
  * error.
  *
- * Cost is one stat() per row; the just-finished scan leaves the existing files
- * warm in the dentry cache, so in the common (nothing-deleted) case this is a
- * cheap metadata pass with no disk reads.
+ * seen(id) is an optional "this row's file was confirmed on disk this run"
+ * oracle (the scan's seen-set): rows it accepts are skipped without a stat(),
+ * so the common nothing-deleted case does no stat()s at all. Pass NULL to
+ * stat() every row.
  */
 int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
 {

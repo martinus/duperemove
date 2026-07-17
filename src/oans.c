@@ -809,16 +809,14 @@ int main(int argc, char **argv)
 			goto out;
 
 		/*
-		 * Drop rows for files that have been deleted from disk since
-		 * they were scanned, so a stale hashfile does not keep growing
-		 * and does not make the dedupe phase load phantom groups. Done
-		 * before process_duplicates() so it works on the pruned set.
+		 * Drop rows for files deleted from disk since they were scanned,
+		 * so a stale hashfile does not keep growing and does not make the
+		 * dedupe phase load phantom groups. Before process_duplicates()
+		 * so it works on the pruned set.
 		 */
 		{
-			int64_t pruned = dbfile_prune_missing_files(db,
-							filescan_file_was_seen);
+			int64_t pruned = filescan_prune_deleted(db);
 
-			filescan_seen_reset();
 			if (pruned > 0)
 				qprintf("Pruned %lld deleted file%s from the "
 					"hashfile\n", (long long)pruned,

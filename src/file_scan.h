@@ -28,12 +28,12 @@ void filescan_walk_begin(void);
 int filescan_walk_run(struct dbhandle *db);
 
 /*
- * True if a file with this id was confirmed on disk during the last walk. Used
- * by the post-scan deleted-file prune to skip re-stat()ing files the scan
- * already visited. filescan_seen_reset() frees the backing bitset.
+ * Remove hashfile rows for files deleted from disk since the last scan. Uses
+ * the walk's seen-set (built during filescan_walk_run) to skip re-stat()ing
+ * files it already confirmed, so call this after scan_files() returns. Returns
+ * the number of rows pruned, or -1 on error.
  */
-bool filescan_file_was_seen(int64_t id);
-void filescan_seen_reset(void);
+int64_t filescan_prune_deleted(struct dbhandle *db);
 
 void fs_get_locked_uuid(uuid_t *uuid);
 
