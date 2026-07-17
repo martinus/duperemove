@@ -23,7 +23,7 @@ CC ?= gcc
 CFLAGS ?= -Wall -ggdb -std=gnu11 -Werror=strict-prototypes -MMD
 PKG_CONFIG ?= pkg-config
 
-MANPAGES=docs/man/oans.8 docs/man/btrfs-extent-same.8 docs/man/hashstats.8
+MANPAGES=docs/man/oans.8
 ZSH_COMPLETION=completion/zsh/_oans
 
 # All C sources live under src/. tests.c is ugly: it includes lots of c files,
@@ -32,8 +32,8 @@ CFILES = $(filter-out src/tests.c,$(sort $(wildcard src/*.c)))
 DEPENDS := $(CFILES:.c=.d)
 OBJECTS := $(CFILES:.c=.o)
 # Main program is 'oans' (compat 'duperemove' symlink added on install).
-install_progs = oans hashstats btrfs-extent-same
-progs = $(install_progs) csum-test
+install_progs = oans
+progs = $(install_progs)
 # The object holding each prog's main() lives at src/<prog>.o.
 PROGS_OBJECTS := $(addprefix src/,$(addsuffix .o,$(progs)))
 SHARED_OBJECTS := $(filter-out $(PROGS_OBJECTS),$(OBJECTS))

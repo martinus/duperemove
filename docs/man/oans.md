@@ -153,6 +153,12 @@ receiving a file list in this manner, oans will skip the hashing phase.
   ~ Print all files in the hashfile and exit. Requires the `--hashfile` option.
 Will print additional information about each file when run with `-v`.
 
+**\--stats**
+  ~ Print a summary of the hashfile and exit: its format and identity, how many
+files and hashes it holds, the total logical data tracked, and how much
+whole-file duplication it records (duplicate groups and reclaimable bytes).
+Requires the `--hashfile` option. (Replaces the standalone `hashstats` tool.)
+
 **-R** `files ..`
   ~ Remove file from the db and exit. oans will read the list from
 standard input if a hyphen (-) is provided. Requires the `--hashfile` option.
@@ -398,7 +404,6 @@ The oans project page can be found on [github](https://github.com/markfasheh/dup
 There is also a [wiki](https://github.com/markfasheh/duperemove/wiki)
 
 # SEE ALSO
-* `hashstats(8)`
 * `filesystems(5)`
 * `btrfs(8)`
 * `xfs(8)`

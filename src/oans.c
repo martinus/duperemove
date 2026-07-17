@@ -26,6 +26,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <sys/stat.h>
 
 #include <glib.h>
 
@@ -52,6 +53,7 @@ unsigned int blocksize = DEFAULT_BLOCKSIZE;
 static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
+static unsigned int stats_only_opt = 0;
 static int opt_no_color = 0;
 struct dbfile_config dbfile_cfg;
 
@@ -70,6 +72,105 @@ static void print_file(char *filename, char *ino, char *subvol)
 		printf("%s\t%s\t%s\n", filename, ino, subvol);
 	else
 		printf("%s\n", filename);
+}
+
+static uint64_t stats_u64(sqlite3 *db, const char *sql)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	uint64_t v = 0;
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+	    sqlite3_step(stmt) == SQLITE_ROW)
+		v = sqlite3_column_int64(stmt, 0);
+	return v;
+}
+
+/*
+ * Print a human-readable report about a hashfile (folds in the old hashstats
+ * tool): identity, contents, and how much whole-file duplication it records.
+ */
+static int print_hashfile_stats(char *filename)
+{
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = dbfile_open_handle(filename);
+	struct dbfile_config cfg;
+	struct dbfile_stats st = {0};
+	struct stat sb;
+	char uuid_str[37] = "";
+	char htype[9] = "";
+	int k;
+	uint64_t files, hashed, unhashed, logical, app_id;
+	uint64_t groups, dupfiles, reclaim, big_size = 0, big_count = 0;
+	sqlite3 *sq;
+
+	if (!db) {
+		eprintf("Error: Could not open \"%s\"\n", filename);
+		return -1;
+	}
+	sq = db->db;
+
+	if (dbfile_get_config(sq, &cfg))
+		return -1;
+	dbfile_get_stats(db, &st);
+	uuid_unparse(cfg.fs_uuid, uuid_str);
+	memcpy(htype, cfg.hash_type, 8);
+	for (k = 7; k >= 0 && (htype[k] == ' ' || htype[k] == '\0'); k--)
+		htype[k] = '\0';
+	app_id = stats_u64(sq, "PRAGMA application_id");
+
+	files    = stats_u64(sq, "select count(*) from files");
+	hashed   = stats_u64(sq, "select count(*) from files where digest is not null");
+	unhashed = files - hashed;
+	logical  = stats_u64(sq, "select ifnull(sum(size),0) from files");
+
+	/* Whole-file duplication: files sharing (digest, size). */
+	groups   = stats_u64(sq, "select count(*) from (select 1 from files "
+		"where digest is not null group by digest, size having count(*) > 1)");
+	dupfiles = stats_u64(sq, "select ifnull(sum(c),0) from (select count(*) c "
+		"from files where digest is not null group by digest, size having c > 1)");
+	reclaim  = stats_u64(sq, "select ifnull(sum((c-1)*size),0) from (select size, "
+		"count(*) c from files where digest is not null group by digest, size having c > 1)");
+	{
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+
+		if (sqlite3_prepare_v2(sq, "select size, count(*) c from files "
+			"where digest is not null group by digest, size "
+			"order by (count(*)-1)*size desc limit 1", -1, &s, NULL) == SQLITE_OK
+		    && sqlite3_step(s) == SQLITE_ROW) {
+			big_size = sqlite3_column_int64(s, 0);
+			big_count = sqlite3_column_int64(s, 1);
+		}
+	}
+
+	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
+	if (stat(filename, &sb) == 0)
+		printf("  %s(%s on disk)%s", col_dim, human_size(sb.st_size), col_reset);
+	printf("\n");
+	printf("  %sformat%s          %d.%d%s\n", col_dim, col_reset, cfg.major,
+	       cfg.minor, app_id == OANS_APP_ID ? "  (oans)" : "");
+	printf("  %shashing%s         %s, %s blocks\n", col_dim, col_reset,
+	       htype, human_size(cfg.blocksize));
+	printf("  %sfilesystem%s      %s\n", col_dim, col_reset, uuid_str);
+
+	printf("\n%s%sfiles%s\n", col_bold, col_blue, col_reset);
+	printf("  %stracked%s         %"PRIu64"\n", col_dim, col_reset, files);
+	printf("  %shashed%s          %"PRIu64"\n", col_dim, col_reset, hashed);
+	if (unhashed)
+		printf("  %sunread%s          %"PRIu64"   %s(unique size, whole-file mode)%s\n",
+		       col_dim, col_reset, unhashed, col_dim, col_reset);
+	printf("  %sextent hashes%s   %"PRIu64"\n", col_dim, col_reset, st.num_e_hashes);
+	printf("  %sblock hashes%s    %"PRIu64"\n", col_dim, col_reset, st.num_b_hashes);
+	printf("  %slogical data%s    %s\n", col_dim, col_reset, human_size(logical));
+
+	printf("\n%s%swhole-file duplicates%s\n", col_bold, col_blue, col_reset);
+	printf("  %sgroups%s          %"PRIu64"\n", col_dim, col_reset, groups);
+	printf("  %sfiles in groups%s %"PRIu64"\n", col_dim, col_reset, dupfiles);
+	printf("  %sreclaimable%s     %s%s%s\n", col_dim, col_reset, col_green,
+	       human_size(reclaim), col_reset);
+	if (big_count > 1)
+		printf("  %slargest group%s   %s", col_dim, col_reset, human_size(big_size));
+	if (big_count > 1)
+		printf(" x %"PRIu64" copies\n", big_count);
+	return 0;
 }
 
 static int list_db_files(char *filename)
@@ -210,6 +311,7 @@ enum {
 	BATCH_SIZE_OPTION,
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
+	STATS_OPTION,
 };
 
 static int process_fdupes(void)
@@ -324,6 +426,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
+		{ "stats", 0, NULL, STATS_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -406,6 +509,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case 'R':
 			rm_only_opt = 1;
+			break;
+		case STATS_OPTION:
+			stats_only_opt = 1;
 			break;
 		case QUIET_OPTION:
 		case 'q':
@@ -503,26 +609,26 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	if (list_only_opt && rm_only_opt) {
-		eprintf("Error: Can not mix '-L' and '-R' options.\n");
+	if (list_only_opt + rm_only_opt + stats_only_opt > 1) {
+		eprintf("Error: use only one of '-L', '-R', '--stats'.\n");
 		return 1;
 	}
 
-	if (list_only_opt || rm_only_opt) {
+	if (list_only_opt || rm_only_opt || stats_only_opt) {
 		if (!options.hashfile || use_hashfile == H_WRITE) {
 			eprintf("Error: --hashfile= option is required "
-				"with '-L' or -R.\n");
+				"with '-L', '-R' or '--stats'.\n");
 			return 1;
 		}
 
-		if (list_only_opt && numfiles) {
-			eprintf("Error: -L option do not take "
+		if ((list_only_opt || stats_only_opt) && numfiles) {
+			eprintf("Error: -L/--stats do not take "
 				"a file list argument\n");
 			return 1;
 		}
 	}
 
-	if (!(options.fdupes_mode || list_only_opt)
+	if (!(options.fdupes_mode || list_only_opt || stats_only_opt)
 			&& numfiles == 0) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
@@ -782,6 +888,8 @@ int main(int argc, char **argv)
 		return list_db_files(options.hashfile);
 	else if (rm_only_opt)
 		return rm_db_files(argc - filelist_idx, &argv[filelist_idx]);
+	else if (stats_only_opt)
+		return print_hashfile_stats(options.hashfile);
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)

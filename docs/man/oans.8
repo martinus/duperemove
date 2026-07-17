@@ -157,6 +157,14 @@ Requires the \f[CR]\-\-hashfile\f[R] option.
 Will print additional information about each file when run with
 \f[CR]\-v\f[R].
 .TP
+\f[B]\-\-stats\f[R]
+Print a summary of the hashfile and exit: its format and identity, how
+many files and hashes it holds, the total logical data tracked, and how
+much whole-file duplication it records (duplicate groups and reclaimable
+bytes).
+Requires the \f[CR]\-\-hashfile\f[R] option.
+(Replaces the standalone \f[CR]hashstats\f[R] tool.)
+.TP
 \f[B]\-R\f[R] \f[CR]files ..\f[R]
 Remove file from the db and exit.
 oans will read the list from standard input if a hyphen (\-) is
@@ -450,8 +458,6 @@ There is also a \c
 wiki
 .UE \c
 .SH SEE ALSO
-.IP \[bu] 2
-\f[CR]hashstats(8)\f[R]
 .IP \[bu] 2
 \f[CR]filesystems(5)\f[R]
 .IP \[bu] 2
