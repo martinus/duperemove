@@ -31,8 +31,11 @@ class ChangedSinceScanTest(DuperemoveTest):
             f.write(b"grown")
         self.sync()
 
-        # dedupe purely from the (now stale) hashfile
-        self.dm("-d", f"--read-hashes={self.hf}", hashfile=False)
+        # dedupe purely from the (now stale) hashfile: scan an unrelated empty
+        # dir, so the tree/ rows are used exactly as recorded, never rescanned
+        empty = self.path("empty")
+        os.makedirs(empty)
+        self.dm("-d", "-r", empty)
         self.assertDmOk()
         self.assertNotIn("Invalid argument", self.out,
                          "size-changed dests must not reach the kernel")

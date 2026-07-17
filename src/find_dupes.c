@@ -235,13 +235,12 @@ next_match:
 }
 
 static int search_extent(struct filerec *file, struct file_extent *extent,
-			 struct results_tree *dupe_extents, struct dbhandle *db)
+			 struct results_tree *dupe_extents)
 {
 	int ret = 0;
 	struct file_block *block, *found_block;
 	struct filerec *found_file;
 	struct dupe_blocks_list *blocklist;
-	struct file_extent found_extent;
 
 	block = find_filerec_block(file, extent->loff);
 	/* No dupe block so no possible dupe. */
@@ -257,16 +256,6 @@ static int search_extent(struct filerec *file, struct file_extent *extent,
 		found_file = found_block->b_file;
 		if (!options.dedupe_same_file && file == found_file)
 			continue;
-
-		/*
-		 * Find the on-disk extent for found_block and check
-		 * that we won't be going over the end of it.
-		 */
-		ret = dbfile_load_one_file_extent(db, found_file,
-						  found_block->b_loff,
-						  &found_extent);
-		if (ret)
-			break;
 
 		/*
 		 * TODO: Allow us to solve for a dupe that straddles
@@ -298,7 +287,7 @@ static void search_file_extents(struct filerec *file, struct results_tree *dupe_
 	unsigned int num_extents, i;
 
 	if (!db) {
-		db = dbfile_open_handle_thread(options.hashfile, &search_pool);
+		db = dbfile_open_handle_thread(&search_pool);
 
 		if (!db) {
 			eprintf("ERROR: Couldn't open db file %s\n",
@@ -330,7 +319,7 @@ static void search_file_extents(struct filerec *file, struct results_tree *dupe_
 	for(i = 0; i < num_extents; i++) {
 		extent = &extents[i];
 
-		ret = search_extent(file, extent, dupe_extents, db);
+		ret = search_extent(file, extent, dupe_extents);
 		if (ret)
 			return;
 	}

@@ -367,50 +367,33 @@ static inline dev_t stx_to_dev(struct statx *stx)
  * Touched only from the single __scan_file() consumer (not the walker threads),
  * so no locking is needed.
  */
-struct subvol_cache_entry {
-	dev_t				dev;
-	uint64_t			subvol;
-	struct subvol_cache_entry	*next;
-};
-static struct subvol_cache_entry *subvol_cache;
+static GHashTable *subvol_cache;	/* dev_t -> subvol id */
 
 static bool subvol_cache_get(dev_t dev, uint64_t *subvol)
 {
-	struct subvol_cache_entry *e;
+	gpointer val;
 
-	for (e = subvol_cache; e; e = e->next) {
-		if (e->dev == dev) {
-			*subvol = e->subvol;
-			return true;
-		}
-	}
-	return false;
+	if (!subvol_cache ||
+	    !g_hash_table_lookup_extended(subvol_cache,
+					  GSIZE_TO_POINTER((gsize)dev),
+					  NULL, &val))
+		return false;
+
+	*subvol = GPOINTER_TO_SIZE(val);
+	return true;
 }
 
 static void subvol_cache_put(dev_t dev, uint64_t subvol)
 {
-	struct subvol_cache_entry *e = malloc(sizeof(*e));
-
-	/* On OOM just skip caching; the caller still has a valid subvol. */
-	if (!e)
-		return;
-
-	e->dev = dev;
-	e->subvol = subvol;
-	e->next = subvol_cache;
-	subvol_cache = e;
+	if (!subvol_cache)
+		subvol_cache = g_hash_table_new(g_direct_hash, g_direct_equal);
+	g_hash_table_insert(subvol_cache, GSIZE_TO_POINTER((gsize)dev),
+			    GSIZE_TO_POINTER((gsize)subvol));
 }
 
 static void subvol_cache_free(void)
 {
-	struct subvol_cache_entry *e = subvol_cache, *next;
-
-	while (e) {
-		next = e->next;
-		free(e);
-		e = next;
-	}
-	subvol_cache = NULL;
+	g_clear_pointer(&subvol_cache, g_hash_table_destroy);
 }
 
 /*
@@ -423,78 +406,46 @@ static void subvol_cache_free(void)
  * cache above - remember each confirmed device and skip the recheck for every
  * later directory on the same subvolume. Listing thread only, so no locking.
  */
-struct verified_dev_entry {
-	dev_t				dev;
-	struct verified_dev_entry	*next;
-};
-static struct verified_dev_entry *verified_devs;
+static GHashTable *verified_devs;	/* set of dev_t */
 /* check_file() runs on the parallel walker threads, so this cache is shared. */
 static GMutex verified_dev_lock;
 
 static bool verified_dev_get(dev_t dev)
 {
-	struct verified_dev_entry *e;
-	bool found = false;
+	bool found;
 
 	g_mutex_lock(&verified_dev_lock);
-	for (e = verified_devs; e; e = e->next)
-		if (e->dev == dev) {
-			found = true;
-			break;
-		}
+	found = verified_devs &&
+		g_hash_table_contains(verified_devs,
+				      GSIZE_TO_POINTER((gsize)dev));
 	g_mutex_unlock(&verified_dev_lock);
 	return found;
 }
 
 static void verified_dev_put(dev_t dev)
 {
-	struct verified_dev_entry *e = malloc(sizeof(*e));
-
-	/* On OOM just skip caching; correctness is unaffected. */
-	if (!e)
-		return;
-
-	e->dev = dev;
 	g_mutex_lock(&verified_dev_lock);
-	e->next = verified_devs;
-	verified_devs = e;
+	if (!verified_devs)
+		verified_devs = g_hash_table_new(g_direct_hash, g_direct_equal);
+	g_hash_table_add(verified_devs, GSIZE_TO_POINTER((gsize)dev));
 	g_mutex_unlock(&verified_dev_lock);
 }
 
 static void verified_dev_free(void)
 {
-	struct verified_dev_entry *e = verified_devs, *next;
-
-	while (e) {
-		next = e->next;
-		free(e);
-		e = next;
-	}
-	verified_devs = NULL;
+	g_clear_pointer(&verified_devs, g_hash_table_destroy);
 }
 
 static char *extract_first_device(const char *fs_source)
 {
-	char *first_device = NULL;
 	const char *colon;
 
 	if (!fs_source)
 		return NULL;
 
 	colon = strchr(fs_source, ':');
-	if (colon) {
-		size_t len = colon - fs_source;
-		first_device = malloc(len + 1);
-		if (!first_device)
-			return NULL;
-		memcpy(first_device, fs_source, len);
-		first_device[len] = '\0';
-	} else {
-		first_device = strdup(fs_source);
-		if (!first_device)
-			return NULL;
-	}
-	return first_device;
+	return colon ? strndup(fs_source, colon - fs_source)
+		     : strdup(fs_source);
 }
 
 /* Get the UUID associated with the FS that stores path */
@@ -840,12 +791,19 @@ static void process_dir(const char *path, struct dbhandle *db)
 	struct statx st;
 	_cleanup_(closedirectory) DIR *dirp = opendir(path);
 	char child[PATH_MAX + 257] = { 0, };
+	size_t dirlen;
 
 	if (dirp == NULL) {
 		eprintf("Error %d: %s while opening directory %s\n",
 			errno, strerror(errno), path);
 		return;
 	}
+
+	/* Seed the (constant) directory prefix once; append names below. */
+	dirlen = strlen(path);
+	memcpy(child, path, dirlen);
+	if (dirlen != 1 || path[0] != '/')
+		child[dirlen++] = '/';
 
 	while (true) {
 		errno = 0;
@@ -867,13 +825,10 @@ static void process_dir(const char *path, struct dbhandle *db)
 		    !(options.recurse_dirs && entry->d_type == DT_DIR))
 			continue;
 
-		if (strlen(path) + 1 + strlen(entry->d_name) > PATH_MAX)
+		if (dirlen + strlen(entry->d_name) > PATH_MAX)
 			continue;
 
-		if (strcmp(path, "/") == 0)
-			sprintf(child, "/%s", entry->d_name);
-		else
-			sprintf(child, "%s/%s", path, entry->d_name);
+		strcpy(child + dirlen, entry->d_name);
 
 		if (statx(0, child, 0, STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS)) {

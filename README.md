@@ -29,9 +29,10 @@ everything. The hashfile is a SQLite database branded with oans's own
 hashfiles (each rebuilds its own) — but they are just caches, so nothing is
 lost.
 
-See [the upstream duperemove man page](http://markfasheh.github.io/duperemove/duperemove.html)
-for the full reference (options, FAQ, and examples) — this fork keeps the same
-command-line interface.
+See [the oans man page](docs/man/oans.md) (`man 8 oans` once installed) for
+the full reference (options, FAQ, and examples). The CLI is a close superset
+of upstream duperemove's: a few new options (`--stats`, `--min-filesize`,
+`--no-color`, `-q`), and a few legacy/testing options removed.
 
 ---
 
@@ -163,8 +164,7 @@ Summary
 ```
 
 For the complete set of options and examples (including hashfile and `fdupes`
-input), see the
-[upstream man page](http://markfasheh.github.io/duperemove/duperemove.html).
+input), see the [oans man page](docs/man/oans.md).
 
 ## Credits & license
 
@@ -176,6 +176,6 @@ Licensed under the **GNU General Public License, version 2** — see
 
 ## Links
 
+- [oans man page](docs/man/oans.md) — full reference
 - [Upstream duperemove](https://github.com/markfasheh/duperemove) — the original project
-- [Upstream man page](http://markfasheh.github.io/duperemove/duperemove.html) — full reference
 - [Upstream wiki](https://github.com/markfasheh/duperemove/wiki) — design & performance notes

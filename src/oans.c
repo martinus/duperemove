@@ -57,12 +57,6 @@ static unsigned int stats_only_opt = 0;
 static int opt_no_color = 0;
 struct dbfile_config dbfile_cfg;
 
-static enum {
-	H_READ,
-	H_WRITE,
-	H_UPDATE,
-} use_hashfile = H_UPDATE;
-
 /* Upper bound for the auto-detected worker thread count (overridable). */
 #define DEFAULT_MAX_AUTO_THREADS	8
 
@@ -72,17 +66,6 @@ static void print_file(char *filename, char *ino, char *subvol)
 		printf("%s\t%s\t%s\n", filename, ino, subvol);
 	else
 		printf("%s\n", filename);
-}
-
-static uint64_t stats_u64(sqlite3 *db, const char *sql)
-{
-	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
-	uint64_t v = 0;
-
-	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
-	    sqlite3_step(stmt) == SQLITE_ROW)
-		v = sqlite3_column_int64(stmt, 0);
-	return v;
 }
 
 static int cmp_u64(const void *a, const void *b)
@@ -141,10 +124,10 @@ static int print_hashfile_stats(char *filename)
 	memcpy(htype, cfg.hash_type, 8);
 	for (k = 7; k >= 0 && (htype[k] == ' ' || htype[k] == '\0'); k--)
 		htype[k] = '\0';
-	app_id = stats_u64(sq, "PRAGMA application_id");
-	page_size = stats_u64(sq, "PRAGMA page_size");
-	page_count = stats_u64(sq, "PRAGMA page_count");
-	freelist = stats_u64(sq, "PRAGMA freelist_count");
+	app_id = dbfile_query_u64(sq, "PRAGMA application_id");
+	page_size = dbfile_query_u64(sq, "PRAGMA page_size");
+	page_count = dbfile_query_u64(sq, "PRAGMA page_count");
+	freelist = dbfile_query_u64(sq, "PRAGMA freelist_count");
 
 	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
 	if (stat(filename, &sb) == 0)
@@ -170,7 +153,7 @@ static int print_hashfile_stats(char *filename)
 	t0 = g_get_monotonic_time() / 1e6;
 	dbfile_get_stats(db, &st);
 	median = 0;
-	files = stats_u64(sq, "select count(*) from files");
+	files = st.num_files;
 	{
 		uint64_t *sizes = files ? malloc(files * sizeof(*sizes)) : NULL;
 		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
@@ -193,10 +176,10 @@ static int print_hashfile_stats(char *filename)
 			median = n ? sizes[n / 2] : 0;
 		} else {
 			/* OOM: fall back to per-figure queries (median sorts in SQL). */
-			hashed  = stats_u64(sq, "select count(*) from files where digest is not null");
-			logical = stats_u64(sq, "select ifnull(sum(size),0) from files");
-			largest = stats_u64(sq, "select ifnull(max(size),0) from files");
-			median  = stats_u64(sq, "select size from files order by size "
+			hashed  = dbfile_query_u64(sq, "select count(*) from files where digest is not null");
+			logical = dbfile_query_u64(sq, "select ifnull(sum(size),0) from files");
+			largest = dbfile_query_u64(sq, "select ifnull(max(size),0) from files");
+			median  = dbfile_query_u64(sq, "select size from files order by size "
 				"limit 1 offset (select (count(*)-1)/2 from files)");
 		}
 		free(sizes);
@@ -304,32 +287,41 @@ static int list_db_files(char *filename)
 	return ret;
 }
 
-static void rm_db_files_from_stdin(struct dbhandle *db)
+/*
+ * Run cb on every line read from stdin, with the trailing newline stripped.
+ * Overlong lines are skipped with a warning; a nonzero cb return stops the
+ * loop and is passed through.
+ */
+static int for_each_stdin_line(int (*cb)(char *line, void *arg), void *arg)
 {
-	_cleanup_(freep) char *path = NULL;
-	size_t pathlen = 0;
-	ssize_t readlen;
+	_cleanup_(freep) char *line = NULL;
+	size_t buflen = 0;
+	ssize_t len;
+	int ret = 0;
 
-	while ((readlen = getline(&path, &pathlen, stdin)) != -1) {
-		if (readlen == 0)
-			continue;
+	while (!ret && (len = getline(&line, &buflen, stdin)) != -1) {
+		if (len > 0 && line[len - 1] == '\n')
+			line[--len] = '\0';
 
-		if (readlen > 0 && path[readlen - 1] == '\n') {
-			path[--readlen] = '\0';
-		}
-
-		if (readlen > PATH_MAX - 1) {
-			eprintf("Path max exceeded: %s\n", path);
+		if (len > PATH_MAX - 1) {
+			eprintf("Path max exceeded: %s\n", line);
 			continue;
 		}
 
-		dbfile_remove_file(db, path);
+		ret = cb(line, arg);
 	}
+	return ret;
+}
+
+static int rm_one_path(char *path, void *db)
+{
+	dbfile_remove_file(db, path);
+	return 0;
 }
 
 static int rm_db_files(int numfiles, char **files)
 {
-	int i, ret;
+	int i, ret = 0;
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = dbfile_open_handle(options.hashfile);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", options.hashfile);
@@ -339,17 +331,17 @@ static int rm_db_files(int numfiles, char **files)
 	for (i = 0; i < numfiles; i++) {
 		const char *name = files[i];
 
-		if (strlen(name) == 1 && name[0] == '-')
-			rm_db_files_from_stdin(db);
+		if (strcmp(name, "-") == 0) {
+			for_each_stdin_line(rm_one_path, db);
+			continue;
+		}
 
-		ret = dbfile_remove_file(db, name);
-		if (ret == 0)
+		if (dbfile_remove_file(db, name))
+			ret = -1;
+		else
 			vprintf("Removed \"%s\" from hashfile.\n", name);
-
-		if (ret)
-			printf("ret ?\n");
 	}
-	return 0;
+	return ret;
 }
 
 static void print_version(void)
@@ -415,8 +407,6 @@ enum {
 	DEBUG_OPTION = CHAR_MAX + 1,
 	HELP_OPTION,
 	VERSION_OPTION,
-	WRITE_HASHES_OPTION,
-	READ_HASHES_OPTION,
 	HASHFILE_OPTION,
 	IO_THREADS_OPTION,
 	CPU_THREADS_OPTION,
@@ -431,67 +421,40 @@ enum {
 	STATS_OPTION,
 };
 
-static int process_fdupes(void)
+/* A blank line ends an fdupes duplicate group; anything else is a member. */
+static int fdupes_one_line(char *path, void *arg [[maybe_unused]])
 {
-	int ret = 0;
-	_cleanup_(freep) char *path = NULL;
-	size_t pathlen = 0;
-	ssize_t readlen;
+	int ret;
 
-	while ((readlen = getline(&path, &pathlen, stdin)) != -1) {
-		if (readlen == 0)
-			continue;
-
-		if (readlen == 1 && path[0] == '\n') {
-			ret = fdupes_dedupe();
-			if (ret)
-				return ret;
-			free_all_filerecs();
-			continue;
-		}
-
-		if (readlen > 0 && path[readlen - 1] == '\n') {
-			path[--readlen] = '\0';
-		}
-
-		if (readlen > PATH_MAX - 1) {
-			eprintf("Path max exceeded: %s\n", path);
-			continue;
-		}
-
-		add_file_fdupes(path);
+	if (path[0] == '\0') {
+		ret = fdupes_dedupe();
+		if (ret)
+			return ret;
+		free_all_filerecs();
+		return 0;
 	}
 
+	add_file_fdupes(path);
+	return 0;
+}
+
+static int process_fdupes(void)
+{
+	return for_each_stdin_line(fdupes_one_line, NULL);
+}
+
+static int add_one_stdin_file(char *path, void *db)
+{
+	if (scan_file(path, db)) {
+		eprintf("Error: cannot add %s into the lookup list\n", path);
+		return 1;
+	}
 	return 0;
 }
 
 static int add_files_from_stdin(struct dbhandle *db)
 {
-	_cleanup_(freep) char *path = NULL;
-	size_t pathlen = 0;
-	ssize_t readlen;
-
-	while ((readlen = getline(&path, &pathlen, stdin)) != -1) {
-		if (readlen == 0)
-			continue;
-
-		if (readlen > 0 && path[readlen - 1] == '\n') {
-			path[--readlen] = '\0';
-		}
-
-		if (readlen > PATH_MAX - 1) {
-			eprintf("Path max exceeded: %s\n", path);
-			continue;
-		}
-
-		if (scan_file(path, db)) {
-			eprintf("Error: cannot add %s into the lookup list\n",
-				path);
-			return 1;
-		}
-	}
-
-	return 0;
+	return for_each_stdin_line(add_one_stdin_file, db);
 }
 
 static int scan_files_from_cmdline(int numfiles, char **files, struct dbhandle *db)
@@ -513,6 +476,11 @@ static int scan_files_from_cmdline(int numfiles, char **files, struct dbhandle *
 static void help(void)
 {
 	execlp("man", "man", "8", "oans", NULL);
+	/* Only reached when man(1) or the man page is missing. */
+	printf("Usage: oans [options] -r -d --hashfile=FILE <files/dirs...>\n"
+	       "Finds duplicate extents and (with -d) submits them for dedupe.\n"
+	       "Full reference: 'man 8 oans' or docs/man/oans.md in the source tree.\n");
+	exit(0);
 }
 
 /*
@@ -521,23 +489,17 @@ static void help(void)
 static int parse_options(int argc, char **argv, int *filelist_idx)
 {
 	int c, numfiles;
-	bool read_hashes = false;
-	bool write_hashes = false;
-	bool update_hashes = false;
 
 	static struct option long_ops[] = {
 		{ "debug", 0, NULL, DEBUG_OPTION },
 		{ "help", 0, NULL, HELP_OPTION },
 		{ "version", 0, NULL, VERSION_OPTION },
-		{ "write-hashes", 1, NULL, WRITE_HASHES_OPTION },
-		{ "read-hashes", 1, NULL, READ_HASHES_OPTION },
 		{ "hashfile", 1, NULL, HASHFILE_OPTION },
 		{ "io-threads", 1, NULL, IO_THREADS_OPTION },
-		{ "hash-threads", 1, NULL, IO_THREADS_OPTION },
 		{ "cpu-threads", 1, NULL, CPU_THREADS_OPTION },
 		{ "skip-zeroes", 0, NULL, SKIP_ZEROES_OPTION },
 		{ "fdupes", 0, NULL, FDUPES_OPTION },
-		{ "dedupe-options=", 1, NULL, DEDUPE_OPTS_OPTION },
+		{ "dedupe-options", 1, NULL, DEDUPE_OPTS_OPTION },
 		{ "quiet", 0, NULL, QUIET_OPTION },
 		{ "exclude", 1, NULL, EXCLUDE_OPTION },
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
@@ -551,7 +513,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		help(); /* Never returns */
 	}
 
-	while ((c = getopt_long(argc, argv, "b:vdDrh?LRqB:m:", long_ops, NULL))
+	while ((c = getopt_long(argc, argv, "b:vdrh?LRqB:m:", long_ops, NULL))
 	       != -1) {
 		switch (c) {
 		case 'b':
@@ -564,8 +526,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			}
 			break;
 		case 'd':
-		case 'D':
-			options.run_dedupe += 1;
+			options.run_dedupe = 1;
 			break;
 		case 'r':
 			options.recurse_dirs = true;
@@ -583,16 +544,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case 'h':
 			human_readable = 1;
 			break;
-		case WRITE_HASHES_OPTION:
-			write_hashes = true;
-			options.hashfile = strdup(optarg);
-			break;
-		case READ_HASHES_OPTION:
-			read_hashes = true;
-			options.hashfile = strdup(optarg);
-			break;
 		case HASHFILE_OPTION:
-			update_hashes = true;
 			options.hashfile = strdup(optarg);
 			break;
 		case IO_THREADS_OPTION:
@@ -670,19 +622,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		return 1;
 	}
 
-	/* Filter out option combinations that don't make sense. */
-	if ((write_hashes + read_hashes + update_hashes) > 1) {
-		eprintf("Error: Specify only one hashfile option.\n");
-		return 1;
-	}
-
-	if (read_hashes)
-		use_hashfile = H_READ;
-	else if (write_hashes)
-		use_hashfile = H_WRITE;
-	else if (update_hashes)
-		use_hashfile = H_UPDATE;
-
 	/*
 	 * Always add the hashfile and its wal etc to the exclude list
 	 * A wildcard would be easier but may exclude extra files silently,
@@ -697,17 +636,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		add_exclude_pattern(tmp);
 	}
 
-	if (read_hashes) {
-		if (numfiles) {
-			eprintf("Error: --read-hashes option does not take a "
-				"file list argument\n");
-			return 1;
-		}
-		goto out_nofiles;
-	}
-
 	if (options.fdupes_mode) {
-		if (read_hashes || write_hashes || update_hashes) {
+		if (options.hashfile) {
 			eprintf("Error: cannot mix hashfile option with "
 				"--fdupes option\n");
 			return 1;
@@ -732,7 +662,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	}
 
 	if (list_only_opt || rm_only_opt || stats_only_opt) {
-		if (!options.hashfile || use_hashfile == H_WRITE) {
+		if (!options.hashfile) {
 			eprintf("Error: --hashfile= option is required "
 				"with '-L', '-R' or '--stats'.\n");
 			return 1;
@@ -751,7 +681,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		return 1;
 	}
 
-out_nofiles:
 	return 0;
 }
 
@@ -967,7 +896,7 @@ int main(int argc, char **argv)
 	init_filerec();
 
 	/* Set the default CPU limits before parsing the user options */
-	get_num_cpus(&(options.cpu_threads), &(options.io_threads));
+	options.cpu_threads = options.io_threads = get_num_cpus();
 
 	/*
 	 * The detected core count can be very high (e.g. 64). Dedup is I/O
@@ -1022,43 +951,38 @@ int main(int argc, char **argv)
 
 	print_header();
 
-	if (use_hashfile == H_WRITE || use_hashfile == H_UPDATE) {
-		ret = dbfile_prune_unscanned_files(db);
-		if (ret) {
-			eprintf("Unable to prune unscanned files\n");
-			goto out;
-		}
-
-		ret = scan_files(argc, argv, filelist_idx, db);
-		if (ret)
-			goto out;
-
-		/*
-		 * Drop rows for files deleted from disk since they were scanned,
-		 * so a stale hashfile does not keep growing and does not make the
-		 * dedupe phase load phantom groups. Before process_duplicates()
-		 * so it works on the pruned set.
-		 */
-		{
-			int64_t pruned = filescan_prune_deleted(db);
-
-			if (pruned > 0)
-				qprintf("Pruned %lld deleted file%s from the "
-					"hashfile\n", (long long)pruned,
-					pruned == 1 ? "" : "s");
-		}
-
-		if (options.hashfile)
-			qprintf("Hashfile \"%s\" written\n",
-				options.hashfile);
+	ret = dbfile_prune_unscanned_files(db);
+	if (ret) {
+		eprintf("Unable to prune unscanned files\n");
+		goto out;
 	}
 
-	if (use_hashfile == H_READ || use_hashfile == H_UPDATE)
-		process_duplicates(db);
+	ret = scan_files(argc, argv, filelist_idx, db);
+	if (ret)
+		goto out;
+
+	/*
+	 * Drop rows for files deleted from disk since they were scanned,
+	 * so a stale hashfile does not keep growing and does not make the
+	 * dedupe phase load phantom groups. Before process_duplicates()
+	 * so it works on the pruned set.
+	 */
+	{
+		int64_t pruned = filescan_prune_deleted(db);
+
+		if (pruned > 0)
+			qprintf("Pruned %lld deleted file%s from the "
+				"hashfile\n", (long long)pruned,
+				pruned == 1 ? "" : "s");
+	}
+
+	if (options.hashfile)
+		qprintf("Hashfile \"%s\" written\n", options.hashfile);
+
+	process_duplicates(db);
 
 	/* Reclaim space if a prune this run left the hashfile mostly free. */
-	if (options.hashfile &&
-	    (use_hashfile == H_WRITE || use_hashfile == H_UPDATE))
+	if (options.hashfile)
 		dbfile_maybe_vacuum(db);
 
 out:
