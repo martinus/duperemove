@@ -29,6 +29,12 @@ for those files which have changed since the last run. Thus you can run
 re-checksum unchanged data. For more on hashfiles see the
 `--hashfile` option below as well as the `Examples` section.
 
+The hashfile is also **self-describing**: each run records its scan-shaping
+options (`-d`, `-r`, `--skip-zeroes`, `--min-filesize`, `--dedupe-options`),
+its paths, and its `--exclude` patterns. Running `oans --hashfile=FILE` with
+no file arguments replays that stored configuration, so a periodic job only
+needs to name the hashfile. See the `Examples` section.
+
 # GENERAL
 oans has two major modes of operation, one of which is a subset
 of the other.
@@ -93,6 +99,14 @@ same `files` list and `-r` arguments on each run of
 `oans`.  The file discovery algorithm is efficient and will only
 visit each file once, even if it is already in the `hashfile`.
 
+    You need not repeat them, though: each run records its scan-shaping
+options, paths and `--exclude` patterns in the hashfile, so running
+`oans --hashfile=FILE` with no file arguments replays the last such run
+(any other options given on that command line are ignored). If none of the
+stored paths still exist, oans refuses to run rather than prune every entry
+(guarding against, for example, an unmounted drive); paths that are
+individually missing are skipped with a warning.
+
     Adding a new path to a hashfile is as simple as adding it to the `files`
 argument.
 
@@ -143,10 +157,12 @@ variable is set.
 Will print additional information about each file when run with `-v`.
 
 **\--stats**
-  ~ Print a summary of the hashfile and exit: its format and identity, how many
-files and hashes it holds, the total logical data tracked, and how much
-whole-file duplication it records (duplicate groups and reclaimable bytes).
-Requires the `--hashfile` option. (Replaces the standalone `hashstats` tool.)
+  ~ Print a summary of the hashfile and exit: its format and identity, the
+stored scan configuration if any (the options, paths and excludes a bare
+`oans --hashfile=FILE` would replay), how many files and hashes it holds, the
+total logical data tracked, and how much whole-file duplication it records
+(duplicate groups and reclaimable bytes). Requires the `--hashfile` option.
+(Replaces the standalone `hashstats` tool.)
 
 **-R** `files ..`
   ~ Remove file from the db and exit. oans will read the list from
@@ -236,12 +252,14 @@ dedupe changed or newly added files:
 
 	oans -dr --hashfile=foo.hash foo/
 
-Don't scan for new files, only update changed or deleted files, then dedupe:
+Replay the last run: with no file arguments, oans reuses the options,
+paths and excludes saved in the hashfile. Handy for a cron job, which then
+only needs to name the hashfile:
 
-	oans -dr --hashfile=foo.hash
+	oans --hashfile=foo.hash
 
 Add directory bar to our hashfile and discover any files that were
-recently added to foo:
+recently added to foo (this also becomes the new stored configuration):
 
 	oans -dr --hashfile=foo.hash foo/ bar/
 
