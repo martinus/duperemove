@@ -85,6 +85,13 @@ static uint64_t stats_u64(sqlite3 *db, const char *sql)
 	return v;
 }
 
+static int cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
 /* Human duration for the timing lines: ms under a second, else seconds. */
 static const char *fmt_dur(char *buf, size_t n, double s)
 {
@@ -154,25 +161,47 @@ static int print_hashfile_stats(char *filename)
 		       col_dim, 100.0 * freelist / page_count, col_reset);
 	fflush(stdout);
 
-	/* --- files: one scan for the counts + sizes, plus the median sort --- */
+	/*
+	 * files: one scan reads every size into an array, from which we get
+	 * count/hashed/logical/largest and (after a fast C sort) the median. An
+	 * in-memory qsort beats a second SQLite "order by size" over millions of
+	 * rows, which is otherwise the most expensive query in the report.
+	 */
 	t0 = g_get_monotonic_time() / 1e6;
 	dbfile_get_stats(db, &st);
+	median = 0;
+	files = stats_u64(sq, "select count(*) from files");
 	{
+		uint64_t *sizes = files ? malloc(files * sizeof(*sizes)) : NULL;
 		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+		size_t n = 0;
 
-		if (sqlite3_prepare_v2(sq, "select count(*), "
-			"ifnull(sum(digest is not null),0), ifnull(sum(size),0), "
-			"ifnull(max(size),0) from files", -1, &s, NULL) == SQLITE_OK
-		    && sqlite3_step(s) == SQLITE_ROW) {
-			files = sqlite3_column_int64(s, 0);
-			hashed = sqlite3_column_int64(s, 1);
-			logical = sqlite3_column_int64(s, 2);
-			largest = sqlite3_column_int64(s, 3);
+		if (sizes && sqlite3_prepare_v2(sq,
+			"select size, digest is not null from files",
+			-1, &s, NULL) == SQLITE_OK) {
+			while (n < files && sqlite3_step(s) == SQLITE_ROW) {
+				uint64_t sz = sqlite3_column_int64(s, 0);
+
+				sizes[n++] = sz;
+				logical += sz;
+				if (sz > largest)
+					largest = sz;
+				if (sqlite3_column_int(s, 1))
+					hashed++;
+			}
+			qsort(sizes, n, sizeof(*sizes), cmp_u64);
+			median = n ? sizes[n / 2] : 0;
+		} else {
+			/* OOM: fall back to per-figure queries (median sorts in SQL). */
+			hashed  = stats_u64(sq, "select count(*) from files where digest is not null");
+			logical = stats_u64(sq, "select ifnull(sum(size),0) from files");
+			largest = stats_u64(sq, "select ifnull(max(size),0) from files");
+			median  = stats_u64(sq, "select size from files order by size "
+				"limit 1 offset (select (count(*)-1)/2 from files)");
 		}
+		free(sizes);
 	}
 	unhashed = files - hashed;
-	median = stats_u64(sq, "select size from files order by size "
-		"limit 1 offset (select (count(*)-1)/2 from files)");
 	t_load = g_get_monotonic_time() / 1e6 - t0;
 
 	printf("\n%s%sfiles%s\n", col_bold, col_blue, col_reset);
