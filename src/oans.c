@@ -46,6 +46,7 @@
 #include "file_scan.h"
 #include "find_dupes.h"
 #include "run_dedupe.h"
+#include "storage.h"
 
 #include "opt.h"
 
@@ -738,6 +739,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 					"an integer, %s found\n", optarg);
 				return EINVAL;
 			}
+			options.io_threads_set = true;
 			break;
 		case CPU_THREADS_OPTION:
 			options.cpu_threads = strtoul(optarg, NULL, 10);
@@ -746,6 +748,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 					"an integer, %s found\n", optarg);
 				return EINVAL;
 			}
+			options.cpu_threads_set = true;
 			break;
 		case SKIP_ZEROES_OPTION:
 			options.skip_zeroes = true;
@@ -1163,6 +1166,33 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 	free(abs);
 }
 
+/*
+ * Refine the auto-detected io-threads default from the backing storage of the
+ * first scan target. Spinning disks are seek-bound and want fewer concurrent
+ * readers than SSDs; a multi-device btrfs pool scales with its spindle count.
+ * A user-supplied --io-threads is always respected. `--autotune` measures the
+ * real optimum; this only picks a sensible starting point with no extra I/O.
+ */
+static void auto_tune_io_threads(const char *root)
+{
+	struct storage_profile p;
+	char desc[96];
+	unsigned int rec;
+
+	if (options.io_threads_set || !root)
+		return;
+
+	if (storage_detect(root, &p) != 0)
+		return;	/* keep the CPU-count default set in main() */
+
+	rec = storage_recommend_io_threads(&p, get_num_cpus());
+	options.io_threads = rec;
+
+	storage_describe(&p, desc, sizeof(desc));
+	vprintf("Storage: %s; using --io-threads=%u (override to change)\n",
+		desc, rec);
+}
+
 int main(int argc, char **argv)
 {
 	int ret, filelist_idx = 0;
@@ -1267,6 +1297,9 @@ int main(int argc, char **argv)
 		qprintf("Replaying stored scan of %d path%s from the hashfile.\n",
 			numfiles, numfiles == 1 ? "" : "s");
 	}
+
+	/* Pick io-threads to suit the target's storage (unless set explicitly). */
+	auto_tune_io_threads(roots[0]);
 
 	print_header();
 

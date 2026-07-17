@@ -196,9 +196,14 @@ but can prevent deduplication of zeroed files.
 
 **\--io-threads**=`N`
   ~ Use N threads for I/O. This is used by the file hashing and dedupe
-stages. The default is the number of host cpus, capped at 8 - beyond that,
-more threads mostly add filesystem lock contention instead of speed. An
-explicit `N` overrides the cap.
+stages. By default oans inspects the backing storage of the scan target and
+picks a value automatically: the number of host cpus (capped at 8) on
+non-rotational disks (SSD/NVMe) or when the media is unknown; fewer on a
+single spinning disk, which is seek-bound; and roughly two per device on a
+multi-device btrfs pool, still capped at 8. Run `oans -v` to see the
+detected storage and the chosen value. An explicit `N` disables the
+auto-detection and is used verbatim. Use `--autotune` to measure the real
+optimum on your hardware.
 
 **\--cpu-threads**=`N`
   ~ Use N threads for CPU bound tasks. This is used by the duplicate

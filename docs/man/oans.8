@@ -219,9 +219,14 @@ Defaults to 128K.
 \f[B]\-\-io\-threads\f[R]=\f[CR]N\f[R]
 Use N threads for I/O.
 This is used by the file hashing and dedupe stages.
-The default is the number of host cpus, capped at 8 \- beyond that, more
-threads mostly add filesystem lock contention instead of speed.
-An explicit \f[CR]N\f[R] overrides the cap.
+By default oans inspects the backing storage of the scan target and picks
+a value automatically: the number of host cpus (capped at 8) on
+non\-rotational disks (SSD/NVMe) or when the media is unknown; fewer on a
+single spinning disk, which is seek\-bound; and roughly two per device on a
+multi\-device btrfs pool, still capped at 8.
+Run \f[CR]oans \-v\f[R] to see the detected storage and the chosen value.
+An explicit \f[CR]N\f[R] disables the auto\-detection and is used verbatim.
+Use \f[CR]\-\-autotune\f[R] to measure the real optimum on your hardware.
 .TP
 \f[B]\-\-cpu\-threads\f[R]=\f[CR]N\f[R]
 Use N threads for CPU bound tasks.

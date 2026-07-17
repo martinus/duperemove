@@ -22,6 +22,9 @@ struct options {
 	bool recurse_dirs : 1;
 	unsigned int io_threads;
 	unsigned int cpu_threads;
+	/* True once the user set the count explicitly, disabling auto-tuning. */
+	bool io_threads_set : 1;
+	bool cpu_threads_set : 1;
 	bool skip_zeroes : 1;
 	bool only_whole_files : 1;
 	bool do_block_hash : 1;
