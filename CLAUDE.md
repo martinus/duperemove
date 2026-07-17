@@ -143,6 +143,12 @@ a fresh scan doesn't recreate-loop; existing files must already carry the brand.
 A failed check unlinks and recreates the hashfile (it's only a cache). Bump
 `DB_FILE_MINOR` on any schema change.
 
+A from-scratch build (new hashfile or a recreated one) sets `hashfile_rebuilt`,
+which makes `dbfile_maybe_vacuum()` force a one-off `VACUUM` at the end: a fresh
+build is at insert density (random-key `path_hash`/digest indexes fill ~2/3), so
+it lands ~15-20% smaller than the un-vacuumed size. Normal incremental runs
+still only VACUUM once ≥25% of the file is free.
+
 ## Correctness invariants
 
 - Ctrl+C is safe: `FIDEDUPERANGE` is atomic and the hashfile stays WAL-consistent

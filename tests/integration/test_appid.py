@@ -5,7 +5,8 @@ recreating it fresh.
 """
 
 import sqlite3
-from harness import DuperemoveTest
+import subprocess
+from harness import DuperemoveTest, DUPEREMOVE
 
 OANS_APP_ID = 0x6F616E73  # ascii "oans"
 
@@ -58,3 +59,18 @@ class AppIdTest(DuperemoveTest):
         self.assertDmOk()
         self.assertIn("Recreating", self.out, "foreign hashfile rebuilt")
         self.assertEqual(OANS_APP_ID, app_id(self.hf), "rebuilt as an oans file")
+
+    def test_rebuild_is_compacted(self):
+        # A from-scratch build is written at insert density, so oans VACUUMs it
+        # once at the end. Run non-quiet (the message is suppressed by -q) after
+        # forcing a rebuild and check the compaction fired.
+        self.mkrand("tree/a", 8000)
+        self.scan(self.path("tree"))
+        set_app_id(self.hf, 0x12345678)  # force a rebuild on the next run
+        proc = subprocess.run(
+            [DUPEREMOVE, "-r", "--hashfile", self.hf, self.path("tree")],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.assertIn("Recreating", proc.stdout)
+        self.assertIn("Compacting", proc.stdout, "rebuilt hashfile is VACUUMed")
+        self.assertEqual(0, sqlite3.connect(self.hf).execute(
+            "PRAGMA freelist_count").fetchone()[0], "no free pages after compaction")
