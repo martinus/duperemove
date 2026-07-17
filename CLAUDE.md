@@ -12,7 +12,7 @@ compat symlink. Some identifiers keep the old name on purpose: the
 ## Build & test
 
 ```sh
-make -j$(nproc)                         # builds oans + helpers
+make -j$(nproc)                         # builds oans
 make check                              # C unit tests (src/tests.c) + Python integration suite
 DUPEREMOVE=./oans python3 tests/run.py           # integration suite only
 ```
