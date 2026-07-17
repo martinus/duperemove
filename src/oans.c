@@ -100,6 +100,7 @@ static int print_hashfile_stats(char *filename)
 	int k;
 	uint64_t files, hashed, unhashed, logical, app_id;
 	uint64_t groups, dupfiles, reclaim;
+	uint64_t page_size, page_count, freelist;
 	sqlite3 *sq;
 
 	if (!db) {
@@ -116,6 +117,9 @@ static int print_hashfile_stats(char *filename)
 	for (k = 7; k >= 0 && (htype[k] == ' ' || htype[k] == '\0'); k--)
 		htype[k] = '\0';
 	app_id = stats_u64(sq, "PRAGMA application_id");
+	page_size = stats_u64(sq, "PRAGMA page_size");
+	page_count = stats_u64(sq, "PRAGMA page_count");
+	freelist = stats_u64(sq, "PRAGMA freelist_count");
 
 	files    = stats_u64(sq, "select count(*) from files");
 	hashed   = stats_u64(sq, "select count(*) from files where digest is not null");
@@ -139,6 +143,10 @@ static int print_hashfile_stats(char *filename)
 	printf("  %shashing%s         %s, %s blocks\n", col_dim, col_reset,
 	       htype, human_size(cfg.blocksize));
 	printf("  %sfilesystem%s      %s\n", col_dim, col_reset, uuid_str);
+	if (page_count > 0)
+		printf("  %sfree space%s      %s   %s(%.1f%% of the file, reclaimed by a VACUUM)%s\n",
+		       col_dim, col_reset, human_size(freelist * page_size),
+		       col_dim, 100.0 * freelist / page_count, col_reset);
 
 	printf("\n%s%sfiles%s\n", col_bold, col_blue, col_reset);
 	printf("  %stracked%s         %"PRIu64"\n", col_dim, col_reset, files);
