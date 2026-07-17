@@ -21,6 +21,9 @@ class StatsTest(DuperemoveTest):
         self.assertRegex(out, r"tracked\s+4")
         self.assertRegex(out, r"groups\s+1")
         self.assertIn("reclaimable", out)
+        # top-groups list: the a/b/c group of 3 shows as "... x 3 ..."
+        self.assertIn("top groups", out)
+        self.assertRegex(out, r"x 3\b")
 
     def test_stats_requires_hashfile(self):
         proc = self.dm("--stats", hashfile=False)

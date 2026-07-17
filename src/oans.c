@@ -99,7 +99,7 @@ static int print_hashfile_stats(char *filename)
 	char htype[9] = "";
 	int k;
 	uint64_t files, hashed, unhashed, logical, app_id;
-	uint64_t groups, dupfiles, reclaim, big_size = 0, big_count = 0;
+	uint64_t groups, dupfiles, reclaim;
 	sqlite3 *sq;
 
 	if (!db) {
@@ -129,17 +129,6 @@ static int print_hashfile_stats(char *filename)
 		"from files where digest is not null group by digest, size having c > 1)");
 	reclaim  = stats_u64(sq, "select ifnull(sum((c-1)*size),0) from (select size, "
 		"count(*) c from files where digest is not null group by digest, size having c > 1)");
-	{
-		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
-
-		if (sqlite3_prepare_v2(sq, "select size, count(*) c from files "
-			"where digest is not null group by digest, size "
-			"order by (count(*)-1)*size desc limit 1", -1, &s, NULL) == SQLITE_OK
-		    && sqlite3_step(s) == SQLITE_ROW) {
-			big_size = sqlite3_column_int64(s, 0);
-			big_count = sqlite3_column_int64(s, 1);
-		}
-	}
 
 	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
 	if (stat(filename, &sb) == 0)
@@ -166,10 +155,37 @@ static int print_hashfile_stats(char *filename)
 	printf("  %sfiles in groups%s %"PRIu64"\n", col_dim, col_reset, dupfiles);
 	printf("  %sreclaimable%s     %s%s%s\n", col_dim, col_reset, col_green,
 	       human_size(reclaim), col_reset);
-	if (big_count > 1)
-		printf("  %slargest group%s   %s", col_dim, col_reset, human_size(big_size));
-	if (big_count > 1)
-		printf(" x %"PRIu64" copies\n", big_count);
+
+	/* Top duplicate groups by reclaimable bytes: size x copies, plus one
+	 * example filename so you can see what is duplicated. */
+	{
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+		bool header = false;
+
+		if (sqlite3_prepare_v2(sq,
+			"select size, count(*) c, min(filename), (count(*)-1)*size w "
+			"from files where digest is not null "
+			"group by digest, size having c > 1 "
+			"order by w desc, size desc limit 10", -1, &s, NULL) == SQLITE_OK) {
+			while (sqlite3_step(s) == SQLITE_ROW) {
+				uint64_t sz = sqlite3_column_int64(s, 0);
+				uint64_t c = sqlite3_column_int64(s, 1);
+				const char *fn = (const char *)sqlite3_column_text(s, 2);
+				uint64_t w = sqlite3_column_int64(s, 3);
+				char szb[48], wb[32];
+
+				if (!header) {
+					printf("  %stop groups%s      %ssize x copies · reclaimable · example%s\n",
+					       col_dim, col_reset, col_dim, col_reset);
+					header = true;
+				}
+				snprintf(szb, sizeof(szb), "%s x %"PRIu64, human_size(sz), c);
+				snprintf(wb, sizeof(wb), "%s", human_size(w));
+				printf("    %-18s %s%10s%s  %s\n", szb, col_dim, wb,
+				       col_reset, fn ? fn : "");
+			}
+		}
+	}
 	return 0;
 }
 
