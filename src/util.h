@@ -75,19 +75,10 @@ void color_init(bool disable);
 void start_timer(void);
 double elapsed_seconds(void);
 
-/* Trivial wrapper around gettimeofday */
-struct elapsed_time {
-	struct timeval	start;
-	struct timeval	end;
-	const char	*name;
-	double		elapsed;
-};
-void record_start(struct elapsed_time *e, const char *name);
-void record_end_print(struct elapsed_time *e);
-
 int num_digits(unsigned long long num);
 
-void get_num_cpus(unsigned int *nr_phys, unsigned int *nr_log);
+/* Online logical CPU count (at least 1). */
+unsigned int get_num_cpus(void);
 
 /* Bump up maximum open file limit. */
 int increase_limits(void);

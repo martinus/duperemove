@@ -158,38 +158,11 @@ uint64_t parse_size(char *s)
 	return strtoull(s, NULL, 10) * mult;
 }
 
-static char *size_strs[] = { "", "K", "M", "G", "T", "P", "E"};
 int pretty_size_snprintf(uint64_t size, char *str, size_t str_bytes)
 {
-	uint32_t num_divs = 0;
-	float fraction;
-
-	if (str_bytes == 0)
-		return 0;
-
 	if (!human_readable)
 		return snprintf(str, str_bytes, "%"PRIu64, size);
-
-	if (size < 1024){
-		fraction = size;
-		num_divs = 0;
-	} else {
-		uint64_t last_size = size;
-		num_divs = 0;
-		while(size >= 1024){
-			last_size = size;
-			size /= 1024;
-			num_divs ++;
-		}
-
-		if (num_divs >= ARRAY_SIZE(size_strs)) {
-			str[0] = '\0';
-			return -1;
-		}
-		fraction = (float)last_size / 1024;
-	}
-	return snprintf(str, str_bytes, "%.1f%sB", fraction,
-			size_strs[num_divs]);
+	return human_size_snprintf(size, str, str_bytes);
 }
 
 void print_stack_trace(void)
@@ -208,26 +181,6 @@ void print_stack_trace(void)
 #endif
 }
 
-void record_start(struct elapsed_time *e, const char *name)
-{
-	e->name = name;
-	gettimeofday(&e->start, NULL);
-}
-
-static void record_end(struct elapsed_time *e)
-{
-	gettimeofday(&e->end, NULL);
-
-	e->elapsed = (e->end.tv_sec - e->start.tv_sec) +
-		((e->end.tv_usec - e->start.tv_usec) / 1000000.0F);
-}
-
-void record_end_print(struct elapsed_time *e)
-{
-	record_end(e);
-	printf("%s took %fs\n", e->name, e->elapsed);
-}
-
 int num_digits(unsigned long long num)
 {
 	unsigned int digits = 0;
@@ -239,140 +192,14 @@ int num_digits(unsigned long long num)
 	return digits;
 }
 
-static int get_core_count_fallback(unsigned int *nr_phys, unsigned int *nr_log)
+unsigned int get_num_cpus(void)
 {
-	char path[PATH_MAX];
-	int ret = 0;
-	DIR *dirp;
-	regex_t regex;
-	regmatch_t pmatch[1];
-	size_t nmatch = 1;
-	struct dirent *entry;
-	int physical = 0 , logical = 0;
+	long n = sysconf(_SC_NPROCESSORS_ONLN);
 
-	ret = snprintf(path, PATH_MAX, "/sys/devices/system/cpu/");
-	if (ret < 0)
-		return ret;
-
-	dirp = opendir(path);
-	if (dirp == NULL)
-		return errno;
-
-	ret = regcomp(&regex, "cpu[[:digit:]]+", REG_EXTENDED);
-	if (ret < 0)
-		goto out_freedir;
-
-	do {
-		entry = readdir(dirp);
-		if (entry) {
-			FILE *filp;
-			int sibling1, sibling2;
-			if (regexec(&regex, entry->d_name, nmatch, pmatch,
-				    0) != 0)
-				continue;
-#define FMT_STRING  "/sys/devices/system/cpu/%s/topology/thread_siblings_list"
-			ret = snprintf(path, PATH_MAX, FMT_STRING,
-				       entry->d_name);
-			if (ret < 0)
-				goto out;
-
-			// When HT is turned off hyperthreads won't have
-			// topology/ subdirectory
-			filp = fopen(path, "r");
-			if (filp == NULL)
-				continue;
-
-			physical++;
-			ret = fscanf(filp, "%d,%d", &sibling1, &sibling2);
-			logical += ret;
-			fclose(filp);
-
-		}
-	} while (entry != NULL);
-
-	// If HT is on logical/physical would have been counted twice due
-	// to the way /sys/devices/system/cpu/ is populated, in this case
-	// adjust counts.
-	if (logical > physical) {
-		logical /= 2;
-		physical /= 2;
-	}
-
-	*nr_log = logical;
-	*nr_phys = physical;
-
-out:
-	regfree(&regex);
-out_freedir:
-	closedir(dirp);
-
-	return ret;
-}
-
-int get_core_count(unsigned int *nr_phys, unsigned int *nr_log)
-{
-	char *line = NULL;
-	size_t n = 0;;
-	int ret;
-	unsigned int logical = 0;
-	unsigned int physical = 0;
-	uint64_t sockets[64] = {0,}; /* supports up to 64 sockets with
-					64 cores per socket */
-
-	FILE *fp = popen("lscpu -p", "r");
-	if (fp == NULL) {
-		eprintf("ERROR: Can't start lscpu\n");
-		return -EINVAL;
-	}
-
-	while ((ret = getline(&line, &n, fp) > 0)) {
-		unsigned int core, socket, unused;
-		/* Skip comment lines */
-		if (line[0] == '#')
-			continue;
-		logical++;
-
-		/* We only care about the core/socket id */
-		ret = sscanf(line, "%u,%u,%u", &unused, &core, &socket);
-		if (ret != 3) {
-			dprintf("Can't parse lscpu line: %s\n", line);
-			continue;
-		}
-
-		if (!(sockets[socket] & (1<<core))) {
-			physical++;
-			sockets[socket] |= (1<<core);
-		}
-	}
-
-	if (logical == 0  || physical  == 0)
-		ret = -EINVAL;
-	else {
-		*nr_phys = physical;
-		*nr_log = logical;
-	}
-
-	free(line);
-	pclose(fp);
-
-	return ret;
-}
-
-void get_num_cpus(unsigned int *nr_phys, unsigned int *nr_log)
-{
-	int ht = 0;
-	int ret = get_core_count(nr_phys, nr_log);
-
-	if (ret < 0) {
-		ret = get_core_count_fallback(nr_phys, nr_log);
-		if (ret < 0)
-			*nr_phys = *nr_log = sysconf(_SC_NPROCESSORS_ONLN);
-	} else
-		ht = *nr_log > *nr_phys;
-
-	dprintf("Detected %u logical and %u physical cpus (ht %s).\n",
-		*nr_log, *nr_phys, ht ? "is on" :
-		ret < 0 ? "detection broken" : "is off");
+	if (n < 1)
+		n = 1;
+	dprintf("Detected %ld cpus.\n", n);
+	return n;
 }
 
 int increase_limits(void) {

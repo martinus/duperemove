@@ -132,18 +132,19 @@ static int dbfile_get_dbpath(sqlite3 *db, char *path)
 	return 0;
 }
 
-static int dbfile_get_application_id(sqlite3 *db, int *out)
+/*
+ * Run a query returning one integer (a count, a PRAGMA, ...) and return its
+ * value; 0 on error or no row.
+ */
+uint64_t dbfile_query_u64(sqlite3 *db, const char *sql)
 {
 	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
-	int ret;
+	uint64_t v = 0;
 
-	*out = 0;
-	ret = sqlite3_prepare_v2(db, "PRAGMA application_id;", -1, &stmt, NULL);
-	if (ret)
-		return ret;
-	if (sqlite3_step(stmt) == SQLITE_ROW)
-		*out = sqlite3_column_int(stmt, 0);
-	return 0;
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+	    sqlite3_step(stmt) == SQLITE_ROW)
+		v = sqlite3_column_int64(stmt, 0);
+	return v;
 }
 
 /* Best-effort: a read-only handle can't write the header, which is fine. */
@@ -159,13 +160,7 @@ static void dbfile_stamp_application_id(sqlite3 *db)
  * written the config rows yet (that happens after the check, in sync_config). */
 static bool dbfile_config_empty(sqlite3 *db)
 {
-	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
-	bool empty = true;
-
-	if (sqlite3_prepare_v2(db, "select 1 from config limit 1;", -1,
-			       &stmt, NULL) == SQLITE_OK)
-		empty = (sqlite3_step(stmt) != SQLITE_ROW);
-	return empty;
+	return dbfile_query_u64(db, "select 1 from config limit 1;") == 0;
 }
 
 static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
@@ -181,7 +176,7 @@ static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
 	 * is a foreign or pre-brand (e.g. duperemove) hashfile - refuse it, and
 	 * the caller recreates it as an oans file.
 	 */
-	dbfile_get_application_id(db, &app_id);
+	app_id = (int)dbfile_query_u64(db, "PRAGMA application_id;");
 	if (app_id != OANS_APP_ID) {
 		eprintf("Hashfile %s is not an oans hashfile "
 			"(application_id 0x%08x); refusing to use it\n", path,
@@ -544,36 +539,6 @@ struct dbhandle *dbfile_open_handle(char *filename)
 "UPDATE files SET digest = ?1, flags = ?2 where id = ?3;"
 	dbfile_prepare_stmt(update_scanned_file, UPDATE_SCANNED_FILE);
 
-#define FIND_BLOCKS                                                     \
-"select files.filename, blocks.loff from files "			\
-"INNER JOIN blocks "							\
-"on blocks.digest = ?1 AND files.id = blocks.fileid;"
-	dbfile_prepare_stmt(find_blocks, FIND_BLOCKS);
-
-#define FIND_TOP_B_HASHES						\
-"select digest, count(digest) from blocks "				\
-"group by digest having (count(digest) > 1) "				\
-"order by (count(digest)) desc;"
-	dbfile_prepare_stmt(find_top_b_hashes, FIND_TOP_B_HASHES);
-
-#define FIND_TOP_E_HASHES						\
-"select digest, count(digest) from extents "				\
-"group by digest having (count(digest) > 1) "				\
-"order by (count(digest)) desc;"
-	dbfile_prepare_stmt(find_top_e_hashes, FIND_TOP_E_HASHES);
-
-#define FIND_B_FILES_COUNT						\
-"select count (distinct files.filename) from files "			\
-"INNER JOIN blocks "							\
-"on blocks.digest = ?1 AND files.id = blocks.fileid;"
-	dbfile_prepare_stmt(find_b_files_count, FIND_B_FILES_COUNT);
-
-#define FIND_E_FILES_COUNT						\
-"select count (distinct files.filename) from files "			\
-"INNER JOIN extents on extents.digest = ?1 "				\
-"AND files.id = extents.fileid;"
-	dbfile_prepare_stmt(find_e_files_count, FIND_E_FILES_COUNT);
-
 #define	UPDATE_EXTENT_POFF						\
 "update extents set poff = ?1 "						\
 "where fileid = ?2 and loff = ?3;"
@@ -691,17 +656,12 @@ struct dbhandle *dbfile_open_handle(char *filename)
 "order by (dedupe_seq > ?1), id;"
 	dbfile_prepare_stmt(get_duplicate_files, GET_DUPLICATE_FILES);
 
-#define GET_FILE_EXTENT							\
-"select poff, loff, len from extents "					\
-"join files on files.id = extents.fileid "				\
-"where fileid = ?1 and loff <= ?2 and (loff + len) > ?2;"
-	dbfile_prepare_stmt(get_file_extent, GET_FILE_EXTENT);
-
 #define GET_NONDUPE_EXTENTS						\
 "select extents.loff, len, poff "					\
 "FROM extents join files on files.id = extents.fileid "			\
-"where files.id = ?1 and "						\
-"(1 = (SELECT COUNT(*) FROM extents as e where e.digest = extents.digest));"
+"where files.id = ?1 and not exists "					\
+"(SELECT 1 FROM extents as e where e.digest = extents.digest "		\
+"and e.rowid <> extents.rowid);"
 	dbfile_prepare_stmt(get_nondupe_extents, GET_NONDUPE_EXTENTS);
 
 #define DELETE_FILE \
@@ -771,7 +731,7 @@ static void cleanup_dbhandle(void *db)
 	dbfile_close_handle(db);
 }
 
-struct dbhandle *dbfile_open_handle_thread(char *filename, struct threads_pool *pool)
+struct dbhandle *dbfile_open_handle_thread(struct threads_pool *pool)
 {
 	struct dbhandle *db;
 	dbfile_lock();
@@ -781,34 +741,6 @@ struct dbhandle *dbfile_open_handle_thread(char *filename, struct threads_pool *
 	if (db)
 		register_cleanup(pool, (void*)&cleanup_dbhandle, db);
 	return db;
-}
-
-uint64_t count_file_by_digest(struct dbhandle *db, unsigned char *digest,
-				bool show_block_hashes)
-{
-	int ret;
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt;
-
-	if (show_block_hashes)
-		stmt = db->stmts.find_b_files_count;
-	else
-		stmt = db->stmts.find_e_files_count;
-
-	ret = sqlite3_bind_blob(stmt, 1, digest, DIGEST_LEN, SQLITE_STATIC);
-	if (ret) {
-		eprintf("Error %d binding digest: %s\n", ret,
-			sqlite3_errstr(ret));
-		return 0;
-	}
-
-	ret = sqlite3_step(stmt);
-	if (ret != SQLITE_ROW && ret != SQLITE_DONE) {
-		eprintf("error %d, file count search: %s\n",
-			ret, sqlite3_errstr(ret));
-		return 0;
-	}
-
-	return sqlite3_column_int64(stmt, 0);
 }
 
 int dbfile_begin_trans(sqlite3 *db)
@@ -1003,27 +935,6 @@ int dbfile_get_stats(struct dbhandle *db, struct dbfile_stats *stats)
 	return ret;
 }
 
-/* Read a single-integer PRAGMA (e.g. "PRAGMA page_count"). */
-static int dbfile_pragma_uint64(sqlite3 *db, const char *pragma, uint64_t *out)
-{
-	sqlite3_stmt *stmt = NULL;
-	int ret = sqlite3_prepare_v2(db, pragma, -1, &stmt, NULL);
-
-	if (ret != SQLITE_OK)
-		return ret;
-
-	ret = sqlite3_step(stmt);
-	if (ret == SQLITE_ROW) {
-		*out = sqlite3_column_int64(stmt, 0);
-		ret = SQLITE_OK;
-	} else if (ret == SQLITE_DONE) {
-		ret = SQLITE_ERROR;
-	}
-
-	sqlite3_finalize(stmt);
-	return ret;
-}
-
 /*
  * VACUUM reclaims free pages, but SQLite reuses them - so under normal scanning
  * the freelist stays near empty and a full-database rewrite would reclaim
@@ -1039,12 +950,11 @@ static int dbfile_pragma_uint64(sqlite3 *db, const char *pragma, uint64_t *out)
 
 void dbfile_maybe_vacuum(struct dbhandle *db)
 {
-	uint64_t freelist = 0, total = 0;
+	uint64_t freelist, total;
 	int ret;
 
-	if (dbfile_pragma_uint64(db->db, "PRAGMA freelist_count", &freelist) ||
-	    dbfile_pragma_uint64(db->db, "PRAGMA page_count", &total))
-		return;
+	freelist = dbfile_query_u64(db->db, "PRAGMA freelist_count");
+	total = dbfile_query_u64(db->db, "PRAGMA page_count");
 
 	if (!hashfile_rebuilt &&
 	    (total == 0 || freelist * 100 < total * VACUUM_FREE_PCT))
@@ -1526,42 +1436,6 @@ int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
 	return 0;
 }
 
-int dbfile_load_one_file_extent(struct dbhandle *db, struct filerec *file,
-				uint64_t loff, struct file_extent *extent)
-{
-	int ret;
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.get_file_extent;
-
-	ret = sqlite3_bind_int64(stmt, 1, file->fileid);
-	if (ret) {
-		perror_sqlite(ret, "binding value");
-		return ret;
-	}
-
-	ret = sqlite3_bind_int64(stmt, 2, loff);
-	if (ret) {
-		perror_sqlite(ret, "binding value");
-		return ret;
-	}
-
-	ret = sqlite3_step(stmt);
-
-	/* TODO: drop me when extent_dedupe_worker() is fixed */
-	if (ret == SQLITE_DONE)
-		return 0;
-
-	if (ret != SQLITE_ROW) {
-		perror_sqlite(ret, "retrieving extent info");
-		return ret;
-	}
-
-	extent->poff = sqlite3_column_int64(stmt, 0);
-	extent->loff = sqlite3_column_int64(stmt, 1);
-	extent->len = sqlite3_column_int64(stmt, 2);
-
-	return 0;
-}
-
 int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 				     struct file_extent **ret_extents,
 				     unsigned int *num_extents)
@@ -1661,23 +1535,6 @@ int dbfile_remove_file(struct dbhandle *db, const char *filename)
 	}
 
 	return 0;
-}
-
-void dbfile_list_files(struct dbhandle *db, int (*callback)(void*, int, char**, char**))
-{
-	int ret;
-	char *err;
-
-#define LIST_FILERECS							\
-"select ino, subvol, size, filename from files;"
-
-	ret = sqlite3_exec(db->db, LIST_FILERECS, callback, NULL, &err);
-	if (ret) {
-		eprintf("error %d, executing file search: %s\n", ret,
-			err);
-		return;
-	}
-	return;
 }
 
 /* Check if the data in the hashfile is in synced with the disk.
@@ -1838,31 +1695,18 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 	return sqlite3_column_int64(stmt, 0);
 }
 
-static uint64_t count_one(sqlite3 *db, const char *sql)
-{
-	sqlite3_stmt *stmt;
-	uint64_t n = 0;
-
-	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-		return 0;
-	if (sqlite3_step(stmt) == SQLITE_ROW)
-		n = sqlite3_column_int64(stmt, 0);
-	sqlite3_finalize(stmt);
-	return n;
-}
-
 uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only)
 {
 	uint64_t files, extents;
 
-	files = count_one(db->db,
+	files = dbfile_query_u64(db->db,
 		"select count(*) from (select 1 from files "
 		"where digest is not null and not (flags & 1) "
 		"group by digest, size having count(*) > 1)");
 	if (whole_file_only)
 		return files;
 
-	extents = count_one(db->db,
+	extents = dbfile_query_u64(db->db,
 		"select count(*) from (select 1 from extents "
 		"group by digest, len having count(*) > 1)");
 	/*

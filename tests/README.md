@@ -2,7 +2,7 @@
 
 Two layers:
 
-- **Unit tests** — `../tests.c`, built and run by `make test`. They exercise
+- **Unit tests** — `../src/tests.c`, built and run by `make test`. They exercise
   pure functions (`get_extent`, block length, the scan's seen-inode set, …).
 - **Integration tests** — `integration/`, run by `make integration`. Python
   stdlib `unittest` (no third-party dependencies). They drive the built

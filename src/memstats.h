@@ -108,24 +108,4 @@ declare_alloc_tracking_header(file_hash_head);
 /* Can be called anywhere we want to dump the above statistics */
 void print_mem_stats(void);
 
-static inline void *malloc_count(size_t size, unsigned long long *num_type,
-				 unsigned long long *max_type)
-{
-	void *obj = malloc(size);
-	if (obj) {
-		(*num_type)++;
-		if (num_type > max_type)
-			*max_type = *num_type;
-	}
-
-	return obj;
-}
-static inline void *calloc_count(size_t size, unsigned long long *num_type)
-{
-	void *obj = malloc(size);
-	if (obj)
-		(*num_type)++;
-	return obj;
-}
-
 #endif	/* __MEMSTATS_H__ */

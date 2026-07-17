@@ -73,8 +73,7 @@ the `-r` switch.
   ~ Enable recursive dir traversal.
 
 **-d**
-  ~ De-dupe the results - only works on `btrfs` and `xfs`. Use this option
-twice to disable the check and try to run the ioctl anyway.
+  ~ De-dupe the results - only works on `btrfs` and `xfs`.
 
 **\--hashfile**=`hashfile`
   ~ Use a file for storage of hashes instead of memory. This option drastically
@@ -111,11 +110,9 @@ but reduces multithreading efficiency.
     Because of that small overhead, its value shall be selected based
 on the average file size and `blocksize`.
 
-    The default is a sane value for
-extents-only lookups, while you can go as low as `1` if you are
-running `oans` on very large files (like virtual machines etc).
-
-    By default, batching is set to 1024.
+    The default of 1024 is a sane value for extents-only lookups, while you
+can go as low as `1` if you are running `oans` on very large files (like
+virtual machines etc).
 
 **-m** `N`, **\--min-filesize**=`N`
   ~ Skip all regular files smaller than `N` bytes (suffixes like `K`, `M`, `G`
@@ -176,18 +173,14 @@ but can prevent deduplication of zeroed files.
 
 **\--io-threads**=`N`
   ~ Use N threads for I/O. This is used by the file hashing and dedupe
-stages. Default is automatically detected based on number of
-host cpus.
+stages. The default is the number of host cpus, capped at 8 - beyond that,
+more threads mostly add filesystem lock contention instead of speed. An
+explicit `N` overrides the cap.
 
 **\--cpu-threads**=`N`
   ~ Use N threads for CPU bound tasks. This is used by the duplicate
-extent finding stage. Default is automatically detected based on
-number of host cpus.
-
-    `Note:` Hyperthreading can adversely affect performance of the
-extent finding stage. If oans detects an Intel CPU with
-hyperthreading it will use half the number of cores reported by the
-system for cpu bound tasks.
+extent finding stage. The default is the number of host cpus, capped at 8;
+an explicit `N` overrides the cap.
 
 **\--dedupe-options**=`options`
   ~ Comma separated list of options which alter how we dedupe. Prepend 'no' to an
@@ -212,25 +205,8 @@ extent-based and block-based deduplication will be disabled. The hashfile will
 be smaller, some operations will be faster, but the deduplication efficiency
 will indeed be reduced.
 
-**\--read-hashes**=`hashfile`
-  ~ **This option is primarily for testing**. See the `--hashfile` option if you want to use hashfiles.
-
-    Read hashes from a hashfile. A file list is not required with this
-option. Dedupe can be done if oans is run from the same base
-directory as is stored in the hash file (basically oans has to
-be able to find the files).
-
-**\--write-hashes**=`hashfile`
-  ~ **This option is primarily for testing**. See the `--hashfile` option if you want to use hashfiles.
-
-    Write hashes to a hashfile. These can be read in at a later date and
-deduped from.
-
 **\--debug**
   ~ Print debug messages, forces `-v` if selected.
-
-**\--hash-threads**=`N`
-  ~ Deprecated, see `--io-threads` above.
 
 **\--exclude**=`PATTERN`
   ~ You can exclude certain files and folders from the deduplication process. This
@@ -295,7 +271,7 @@ kernel FIDEDUPERANGE ioctl. In order to ensure data integrity, the
 kernel locks out other access to the file and does a byte-by-byte
 compare before proceeding with the dedupe.
 
-## Is is safe to interrupt the program (Ctrl-C)?
+## Is it safe to interrupt the program (Ctrl-C)?
 
 Yes. The Linux kernel deals with the actual data. On oans' side,
 a transactional database engine is used. The result is that you
@@ -367,41 +343,23 @@ your disks and cpu. In those situations where resources are limited you may
 have success by breaking up the input data set into smaller pieces.
 
 When using a hashfile, oans will only store duplicate hashes in
-memory. During normal operation then the hash tree will make up the
-largest portion of oans memory usage. As of oans v0.11
-hash entries are 88 bytes in size. If you know the number of duplicate
-blocks in your data set you can get a rough approximation of memory
-usage by multiplying with the hash entry size.
-
-Actual performance numbers are dependent on hardware - up to date
-testing information is kept on the oans wiki (see below for the link).
+memory, so even very large data sets can be processed with a modest
+memory footprint.
 
 ## How large of a hashfile will oans create?
 
-Hashfiles are essentially sqlite3 database files with several tables,
-the largest of which are the files and extents tables. Each extents
-table entry is about 72 bytes though that may grow as features are
-added. The size of a files table entry depends on the file path but a
-good estimate is around 270 bytes per file. The number of extents in a
-data set is directly proportional to file fragmentation level.
+Hashfiles are sqlite3 database files; their size scales with the number
+of files and extents tracked, and grows with file fragmentation. To
+inspect an existing hashfile - its size on disk, contents, and how much
+duplication it records - run:
 
-If you know the total number of extents and files in your data set then
-you can calculate the hashfile size as:
-
-	Hashfile Size = Num Hashes * 72 + Num Files * 270
-
-Using a real world example of 1TB (8388608 128K blocks) of data over 1000 files:
-
-	8388608 * 72 + 270 * 1000 = 755244720 or about 720MB for 1TB spread over 1000 files.
-
-`Note that none of this takes database overhead into account.`
+	oans --stats --hashfile=foo.hash
 
 # NOTES
 Deduplication is currently only supported by the `btrfs` and `xfs` filesystem.
 
-The oans project page can be found on [github](https://github.com/markfasheh/duperemove)
-
-There is also a [wiki](https://github.com/markfasheh/duperemove/wiki)
+The oans project page can be found on [github](https://github.com/martinus/oans).
+oans is a fork of [duperemove](https://github.com/markfasheh/duperemove).
 
 # SEE ALSO
 * `filesystems(5)`

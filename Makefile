@@ -101,16 +101,16 @@ doc:
 DIST         = oans-$(VERSION)
 DIST_TARBALL = $(VERSION).tar.gz
 DIST_SOURCES = $(CFILES) $(sort $(wildcard src/*.h)) LICENSE Makefile \
-	README.md $(MANPAGE)
+	README.md docs/man/oans.md $(MANPAGE) $(COMPLETION)
 
 # Source tarball with the resolved version embedded, so tarball builds (no
-# .git) still report it.
+# .git) still report it. --parents keeps the src/, docs/, completion/ layout.
 tarball: clean $(DIST_SOURCES)
 	tmp=$$(mktemp -d) && mkdir -p "$$tmp/$(DIST)" && \
-	cp $(DIST_SOURCES) "$$tmp/$(DIST)" && \
+	cp --parents $(DIST_SOURCES) "$$tmp/$(DIST)" && \
 	echo '$(VERSION)' > "$$tmp/$(DIST)/version" && \
 	tar -C "$$tmp" -zcf $(DIST_TARBALL) $(DIST) && \
 	rm -fr "$$tmp"
 
 clean:
-	rm -f $(OBJECTS) $(DEPENDS) oans test $(DIST_TARBALL) *~
+	rm -f $(OBJECTS) $(DEPENDS) oans test test.d $(DIST_TARBALL) *~

@@ -596,7 +596,7 @@ static void *psearch_progress_thread(void * p)
 		}
 
 		/* Do not waste too much cpu */
-		usleep(100);
+		usleep(100 * 1000);
 	} while (search_total != search_processed);
 	printf("\n");
 	return NULL;

@@ -323,6 +323,17 @@ static void pick_least_fragmented_target(struct dupe_extents *dext)
 		list_move(&best->e_list, &dext->de_extents);
 }
 
+/* Show this group on the thread's status line: target path (the group's first
+ * member) plus the bytes the kernel still has to byte-verify as work total. */
+static void slot_show_group(struct pscan_thread *slot, struct dupe_extents *dext)
+{
+	strncpy(slot->file_path,
+		list_first_entry(&dext->de_extents, struct extent,
+				 e_list)->e_file->filename, PATH_MAX);
+	slot->file_total_bytes = dext->de_len * (dext->de_num_dupes - 1);
+	slot->file_scanned_bytes = 0;
+}
+
 #define	DEDUPE_EXTENTS_CLEANED	(-1)
 static int dedupe_extent_list(struct dupe_extents *dext,
 			      struct pscan_thread *slot,
@@ -388,11 +399,7 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 
 	/* clean_deduped/target selection may have changed the group; show the
 	 * real target and remaining work on this thread's status line. */
-	strncpy(slot->file_path,
-		list_first_entry(&dext->de_extents, struct extent,
-				 e_list)->e_file->filename, PATH_MAX);
-	slot->file_total_bytes = len * (dext->de_num_dupes - 1);
-	slot->file_scanned_bytes = 0;
+	slot_show_group(slot, dext);
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
 		if (list_is_last(&extent->e_list, &dext->de_extents))
@@ -660,7 +667,6 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 			 * a better move.
 			 * TODO: do not delete the extents but rescan every files to fetch
 			 * the new extents mapping as well as their new hashes
-			 * This may cause dbfile_load_one_file_extent() to raise an error.
 			 */
 			dbfile_remove_extent_hashes(db, extent->e_file->fileid);
 		} else {
@@ -696,11 +702,7 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	 * byte-verify - group length times the number of copies to dedupe -
 	 * as the work total.
 	 */
-	strncpy(slot->file_path,
-		list_first_entry(&dext->de_extents, struct extent,
-				 e_list)->e_file->filename, PATH_MAX);
-	slot->file_total_bytes = dext->de_len * (dext->de_num_dupes - 1);
-	slot->file_scanned_bytes = 0;
+	slot_show_group(slot, dext);
 
 	extent_dedupe_worker(dext, slot, &fiemap_bytes, &kern_bytes);
 
@@ -826,7 +828,6 @@ void dedupe_end(void)
 
 void dedupe_results(struct results_tree *res, bool whole_file)
 {
-	int ret;
 	GError *err = NULL;
 
 	/*
@@ -862,11 +863,8 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 	total_dedupe_passes = res->num_dupes;
 	leading_spaces = num_digits(total_dedupe_passes);
 
-	ret = push_extents(res);
-	if (ret) {
-		eprintf("Fatal error while deduping: %s\n", err->message);
-		g_error_free(err);
-	}
+	/* On failure push_extents() has already reported the error. */
+	push_extents(res);
 
 	g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for all work */
 }

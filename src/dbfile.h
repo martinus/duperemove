@@ -38,11 +38,6 @@ struct stmts {
 	sqlite3_stmt *insert_block;
 	sqlite3_stmt *insert_extent;
 	sqlite3_stmt *update_scanned_file;
-	sqlite3_stmt *find_blocks;
-	sqlite3_stmt *find_top_b_hashes;
-	sqlite3_stmt *find_top_e_hashes;
-	sqlite3_stmt *find_b_files_count;
-	sqlite3_stmt *find_e_files_count;
 	sqlite3_stmt *update_extent_poff;
 	sqlite3_stmt *write_file;
 	sqlite3_stmt *remove_block_hashes;
@@ -51,7 +46,6 @@ struct stmts {
 	sqlite3_stmt *get_duplicate_blocks;
 	sqlite3_stmt *get_duplicate_extents;
 	sqlite3_stmt *get_duplicate_files;
-	sqlite3_stmt *get_file_extent;
 	sqlite3_stmt *get_nondupe_extents;
 	sqlite3_stmt *delete_file;
 	sqlite3_stmt *delete_file_by_id;
@@ -86,10 +80,10 @@ struct dbhandle *dbfile_open_handle(char *filename);
 void dbfile_close_handle(struct dbhandle *db);
 
 /*
- * Open the database
+ * Open the database (options.hashfile)
  * On success, the handle is registered to be freed when the thread pool is freed
  */
-struct dbhandle *dbfile_open_handle_thread(char *filename, struct threads_pool *pool);
+struct dbhandle *dbfile_open_handle_thread(struct threads_pool *pool);
 
 void dbfile_lock(void);
 void dbfile_unlock(void);
@@ -113,11 +107,11 @@ struct dbfile_stats {
 };
 int dbfile_get_stats(struct dbhandle *db, struct dbfile_stats *stats);
 
+/* Run a query returning one integer and return its value; 0 on error/no row. */
+uint64_t dbfile_query_u64(sqlite3 *db, const char *sql);
+
 /* VACUUM the hashfile, but only when enough of it is free to be worth it. */
 void dbfile_maybe_vacuum(struct dbhandle *db);
-
-uint64_t count_file_by_digest(struct dbhandle *db, unsigned char *digest,
-				bool show_block_hashes);
 
 struct hash_tree;
 
@@ -142,8 +136,6 @@ struct file_extent {
 int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 				     struct file_extent **ret_extents,
 				     unsigned int *num_extents);
-int dbfile_load_one_file_extent(struct dbhandle *db, struct filerec *file,
-				uint64_t loff, struct file_extent *extent);
 
 int dbfile_load_one_filerec(struct dbhandle *db, int64_t fileid,
 				struct filerec **file);
@@ -176,8 +168,6 @@ int dbfile_iter_files(struct dbhandle *db, iter_files_func func);
 
 int dbfile_remove_extent_hashes(struct dbhandle *db, int64_t fileid);
 int dbfile_remove_file(struct dbhandle *db, const char *filename);
-
-void dbfile_list_files(struct dbhandle *db, int (*callback)(void*, int, char**, char**));
 
 int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 				struct file *dbfile);
