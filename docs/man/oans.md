@@ -87,8 +87,9 @@ dedupe runs.
 `oans` will check the file paths stored inside of it for changes.
 Files which have changed will be rescanned and their updated hashes will be
 written to the `hashfile`. Entries for files that were deleted from disk are
-not pruned automatically; use `-R` to remove specific paths from the
-`hashfile`.
+pruned automatically on the next scan (the check is by existence, so files
+merely outside the paths scanned this run are kept); the hashfile is compacted
+when enough of it becomes free. `-R` still removes specific paths explicitly.
 
     New files are only added to the `hashfile` if they are discoverable via
 the `files` argument. For that reason you probably want to provide the

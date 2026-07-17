@@ -808,6 +808,21 @@ int main(int argc, char **argv)
 		if (ret)
 			goto out;
 
+		/*
+		 * Drop rows for files that have been deleted from disk since
+		 * they were scanned, so a stale hashfile does not keep growing
+		 * and does not make the dedupe phase load phantom groups. Done
+		 * before process_duplicates() so it works on the pruned set.
+		 */
+		{
+			int64_t pruned = dbfile_prune_missing_files(db);
+
+			if (pruned > 0)
+				qprintf("Pruned %lld deleted file%s from the "
+					"hashfile\n", (long long)pruned,
+					pruned == 1 ? "" : "s");
+		}
+
 		if (options.hashfile)
 			qprintf("Hashfile \"%s\" written\n",
 				options.hashfile);

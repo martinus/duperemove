@@ -37,12 +37,10 @@ class IncrementalTest(DuperemoveTest):
         self.assertDmOk()
         self.assertEqual(2, self.hf_count("files"), "new file added on rescan")
 
-    def test_rescan_retains_deleted_file_row(self):
-        # duperemove's prune only removes NULL-digest rows (interrupted-scan
-        # leftovers); a file deleted from disk keeps its digest and is simply
-        # never revisited, so its row survives (use -R to drop it). This matches
-        # the documented behavior and upstream; the test pins it so a change in
-        # either direction is noticed.
+    def test_rescan_prunes_deleted_file(self):
+        # A file deleted from disk is pruned from the hashfile automatically on
+        # the next scan (its row plus the cascaded extent/block hashes), so a
+        # stale hashfile does not keep growing.
         self.mkrand("tree/a", 10000)
         self.mkrand("tree/b", 10000)
         self.scan(self.path("tree"))
@@ -50,10 +48,27 @@ class IncrementalTest(DuperemoveTest):
         os.remove(self.path("tree/b"))
         self.scan(self.path("tree"))
         self.assertDmOk()
-        self.assertEqual(2, self.hf_count("files"), "deleted file's row retained")
+        self.assertEqual(1, self.hf_count("files"), "deleted file's row pruned")
         self.assertEqual(
-            1, self.hf_scalar("select count(*) from files where filename like '%/b'"),
-            "the deleted file's row is still present")
+            0, self.hf_scalar("select count(*) from files where filename like '%/b'"),
+            "the deleted file's row is gone")
+        self.assertEqual(
+            0, self.hf_scalar("select count(*) from extents "
+                              "where fileid not in (select id from files)"),
+            "no orphaned extent hashes left behind")
+
+    def test_prune_is_stat_based_not_scope_based(self):
+        # Pruning is stat-based: scanning only a subdirectory must NOT drop the
+        # rows of files elsewhere in the hashfile that still exist on disk. A
+        # "delete everything I didn't walk" prune would wrongly nuke them.
+        self.mkrand("tree/keep/a", 10000)
+        self.mkrand("tree/other/b", 10000)
+        self.scan(self.path("tree"))
+        self.assertEqual(2, self.hf_count("files"))
+        self.scan(self.path("tree/keep"))           # only part of the tree
+        self.assertDmOk()
+        self.assertEqual(2, self.hf_count("files"),
+                         "out-of-scope but still-existing file retained")
 
     def test_rescan_prunes_null_digest_rows(self):
         # The NULL-digest prune does fire: a stale half-scanned row is cleaned up.

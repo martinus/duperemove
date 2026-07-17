@@ -41,6 +41,7 @@ struct stmts {
 	sqlite3_stmt *get_file_extent;
 	sqlite3_stmt *get_nondupe_extents;
 	sqlite3_stmt *delete_file;
+	sqlite3_stmt *delete_file_by_id;
 	sqlite3_stmt *select_file_changes;
 	sqlite3_stmt *count_b_hashes;
 	sqlite3_stmt *count_e_hashes;
@@ -199,6 +200,7 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db);
  */
 uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only);
 int dbfile_prune_unscanned_files(struct dbhandle *db);
+int64_t dbfile_prune_missing_files(struct dbhandle *db);
 
 /* Build the find-dupes-phase indexes (deferred past the scan). See dbfile.c. */
 int dbfile_create_search_indexes(struct dbhandle *db);
