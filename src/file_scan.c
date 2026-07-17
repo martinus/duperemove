@@ -74,6 +74,7 @@ SLIST_HEAD(exclude_list, exclude_file) exclude_head = SLIST_HEAD_INITIALIZER(exc
 static int __scan_file(char *path, struct dbhandle *db, struct statx *st);
 static bool seen_inode(uint64_t ino, uint64_t subvol);
 static void mark_inode_seen(uint64_t ino, uint64_t subvol);
+static void mark_file_seen(int64_t id);
 
 static struct threads_pool scan_pool;
 
@@ -1055,8 +1056,10 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 
 	/* Database is up-to-date, nothing more to do */
 	if (dbfile.mtime == timestamp_to_nano(st->stx_mtime)
-	    && dbfile.size == st->stx_size && !file_renamed)
+	    && dbfile.size == st->stx_size && !file_renamed) {
+		mark_file_seen(dbfile.id);	/* still on disk: prune can skip it */
 		return 0;
+	}
 
 	if (options.batch_size != 0) {
 		counter += 1;
@@ -1106,6 +1109,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		dbfile_unlock();
 		return 0;
 	}
+	mark_file_seen(fileid);		/* on disk: the prune can skip it */
 
 	scan_write_end();
 	dbfile_unlock();
@@ -1713,6 +1717,70 @@ int add_exclude_pattern(const char *pattern)
  * (not the walker threads), so it needs no locking.
  */
 static GHashTable *seen_inodes;
+
+/*
+ * Bitset of file ids (rowids) confirmed to exist on disk during this walk, so
+ * the post-scan deleted-file prune can skip re-stat()ing them (the walk already
+ * stat()d every file it visited). It is only a "definitely exists, skip stat"
+ * hint: a missed id just gets stat()d by the prune (still correct), and a set
+ * bit always means the file was seen this run, so it can never cause a live
+ * file to be pruned. Populated on the single __scan_file() consumer, so no
+ * locking. It deliberately outlives filescan_free(): the prune writes to the
+ * hashfile, so it has to run after the batched scan writer has committed and
+ * released the WAL write lock (i.e. after filescan_free()), and it reads this
+ * set. filescan_prune_deleted() consumes and frees it.
+ */
+static uint64_t *seen_files;
+static size_t seen_files_nwords;
+
+static void mark_file_seen(int64_t id)
+{
+	size_t word;
+
+	if (id < 0)
+		return;
+	word = (size_t)id / 64;
+	if (word >= seen_files_nwords) {
+		size_t ncap = seen_files_nwords ? seen_files_nwords : 1024;
+		uint64_t *tmp;
+
+		while (ncap <= word)
+			ncap *= 2;
+		tmp = realloc(seen_files, ncap * sizeof(*seen_files));
+		if (!tmp)	/* OOM: skip; prune just stat()s it (still correct) */
+			return;
+		memset(tmp + seen_files_nwords, 0,
+		       (ncap - seen_files_nwords) * sizeof(*tmp));
+		seen_files = tmp;
+		seen_files_nwords = ncap;
+	}
+	seen_files[word] |= (uint64_t)1 << ((size_t)id % 64);
+}
+
+static bool file_was_seen(int64_t id)
+{
+	size_t word = (size_t)id / 64;
+
+	if (id < 0 || word >= seen_files_nwords)
+		return false;
+	return (seen_files[word] >> ((size_t)id % 64)) & 1;
+}
+
+/*
+ * Remove hashfile rows for files deleted from disk since the last scan, using
+ * the walk's seen-set to skip re-stat()ing files it already confirmed. Call
+ * after scan_files() has returned (the scan writer must be committed first).
+ * Returns the number pruned, or -1 on error. Frees the seen-set.
+ */
+int64_t filescan_prune_deleted(struct dbhandle *db)
+{
+	int64_t pruned = dbfile_prune_missing_files(db, file_was_seen);
+
+	free(seen_files);
+	seen_files = NULL;
+	seen_files_nwords = 0;
+	return pruned;
+}
 
 struct ino_key {
 	uint64_t	ino;

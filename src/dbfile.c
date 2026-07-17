@@ -639,6 +639,10 @@ struct dbhandle *dbfile_open_handle(char *filename)
 "delete from files where path_hash = ?1 and filename = ?2;"
 	dbfile_prepare_stmt(delete_file, DELETE_FILE);
 
+#define DELETE_FILE_BY_ID \
+"delete from files where id = ?1;"
+	dbfile_prepare_stmt(delete_file_by_id, DELETE_FILE_BY_ID);
+
 #define SELECT_FILE_CHANGES						\
 "select mtime, size, filename, id from files where ino = ?1 and subvol = ?2;"
 	dbfile_prepare_stmt(select_file_changes, SELECT_FILE_CHANGES);
@@ -1791,9 +1795,9 @@ uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only)
  * whose digest is still NULL. This happens when a previous run was interrupted
  * (e.g. ctrl^C) after inserting a file record but before storing its hashes.
  *
- * Note this does NOT remove entries for files deleted from disk: those keep a
- * valid digest and are simply never revisited by the scan. Use -R to drop
- * specific paths from the hashfile.
+ * Files deleted from disk are handled separately by
+ * dbfile_prune_missing_files() (they keep a valid digest, so they are not
+ * caught here).
  */
 int dbfile_prune_unscanned_files(struct dbhandle *db)
 {
@@ -1807,4 +1811,100 @@ int dbfile_prune_unscanned_files(struct dbhandle *db)
 	}
 
 	return 0;
+}
+
+/*
+ * Drop rows for files that no longer exist on disk (deleted since they were
+ * scanned). Runs automatically after a scan. It is stat-based, not
+ * "delete everything not walked this run": a row is removed only when its path
+ * genuinely resolves to ENOENT, so scanning a subset of the tree (or sharing
+ * one hashfile across several trees) never prunes files that still exist but
+ * were simply out of scope this run. Extent/block hashes cascade away via the
+ * ON DELETE CASCADE foreign key. Returns the number of files pruned, or -1 on
+ * error.
+ *
+ * seen(id) is an optional "this row's file was confirmed on disk this run"
+ * oracle (the scan's seen-set): rows it accepts are skipped without a stat(),
+ * so the common nothing-deleted case does no stat()s at all. Pass NULL to
+ * stat() every row.
+ */
+int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
+{
+	sqlite3_stmt *sel = NULL;
+	sqlite3_stmt *del = db->stmts.delete_file_by_id;
+	int64_t *gone = NULL;
+	size_t n = 0, cap = 0;
+	int64_t removed = -1;
+	int ret;
+
+	ret = sqlite3_prepare_v2(db->db, "select id, filename from files;",
+				 -1, &sel, NULL);
+	if (ret) {
+		perror_sqlite(ret, "preparing prune-missing query");
+		return -1;
+	}
+
+	/* Collect the ids first, then delete: don't mutate the table mid-scan. */
+	while ((ret = sqlite3_step(sel)) == SQLITE_ROW) {
+		int64_t id = sqlite3_column_int64(sel, 0);
+		const char *fn;
+		struct stat st;
+
+		/* The walk already confirmed this file on disk - skip the stat. */
+		if (seen && seen(id))
+			continue;
+
+		fn = (const char *)sqlite3_column_text(sel, 1);
+		if (!fn || stat(fn, &st) == 0)
+			continue;
+		/* Only ENOENT/ENOTDIR mean "gone"; keep rows on EACCES, EIO, etc. */
+		if (errno != ENOENT && errno != ENOTDIR)
+			continue;
+
+		if (n == cap) {
+			size_t ncap = cap ? cap * 2 : 512;
+			int64_t *tmp = realloc(gone, ncap * sizeof(*gone));
+			if (!tmp) {
+				eprintf("Out of memory pruning missing files.\n");
+				goto out;
+			}
+			gone = tmp;
+			cap = ncap;
+		}
+		gone[n++] = id;
+	}
+	if (ret != SQLITE_DONE) {
+		perror_sqlite(ret, "scanning files to prune");
+		goto out;
+	}
+	sqlite3_finalize(sel);
+	sel = NULL;
+
+	if (n == 0) {
+		removed = 0;
+		goto out;
+	}
+
+	if (dbfile_begin_trans(db->db))
+		goto out;
+	for (size_t i = 0; i < n; i++) {
+		sqlite3_reset(del);
+		sqlite3_bind_int64(del, 1, gone[i]);
+		ret = sqlite3_step(del);
+		if (ret != SQLITE_DONE) {
+			perror_sqlite(ret, "deleting missing file");
+			dbfile_commit_trans(db->db);
+			goto out;
+		}
+	}
+	sqlite3_reset(del);
+	if (dbfile_commit_trans(db->db))
+		goto out;
+
+	removed = (int64_t)n;
+out:
+	if (sel)
+		sqlite3_finalize(sel);
+	free(gone);
+	return removed;
 }

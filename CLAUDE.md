@@ -67,6 +67,12 @@ Startup/scan cost has burned us before. The rules:
   delete rows for other links to the same inode. An in-memory `seen_inodes` set
   guards this; a batch that aborts here can silently empty the hashfile while
   exiting 0. There's a regression test — keep it.
+- **Deleted-file pruning is automatic and stat-based.** After each scan,
+  `dbfile_prune_missing_files()` drops rows whose path `stat()`s to ENOENT
+  (extent/block hashes cascade via the FK), then `dbfile_maybe_vacuum` compacts
+  when ≥25% is free. It must stay stat-based, not "delete rows not walked this
+  run" — otherwise scanning a subdir (or a shared hashfile) would nuke
+  out-of-scope files. Pinned by `test_prune_is_stat_based_not_scope_based`.
 
 ## Scan parallelism (the walk)
 

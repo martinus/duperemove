@@ -27,6 +27,14 @@ int scan_file(char *name, struct dbhandle *db);
 void filescan_walk_begin(void);
 int filescan_walk_run(struct dbhandle *db);
 
+/*
+ * Remove hashfile rows for files deleted from disk since the last scan. Uses
+ * the walk's seen-set (built during filescan_walk_run) to skip re-stat()ing
+ * files it already confirmed, so call this after scan_files() returns. Returns
+ * the number of rows pruned, or -1 on error.
+ */
+int64_t filescan_prune_deleted(struct dbhandle *db);
+
 void fs_get_locked_uuid(uuid_t *uuid);
 
 /* For dbfile.c */

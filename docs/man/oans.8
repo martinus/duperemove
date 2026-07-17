@@ -87,9 +87,11 @@ If it exists, \f[CR]oans\f[R] will check the file paths stored
 inside of it for changes.
 Files which have changed will be rescanned and their updated hashes will
 be written to the \f[CR]hashfile\f[R].
-Entries for files that were deleted from disk are not pruned
-automatically; use \f[CR]-R\f[R] to remove specific paths from the
-\f[CR]hashfile\f[R].
+Entries for files that were deleted from disk are pruned automatically
+on the next scan (the check is by existence, so files merely outside the
+paths scanned this run are kept); the hashfile is compacted when enough
+of it becomes free.
+\f[CR]-R\f[R] still removes specific paths explicitly.
 .PP
 New files are only added to the \f[CR]hashfile\f[R] if they are
 discoverable via the \f[CR]files\f[R] argument.
