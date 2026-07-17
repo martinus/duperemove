@@ -843,14 +843,14 @@ out:
 	return ret;
 }
 
-static int sync_config_int(sqlite3_stmt *stmt, const char *key, int val)
+static int sync_config_int(sqlite3_stmt *stmt, const char *key, int64_t val)
 {
 	int ret;
 
 	ret = sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
 	if (ret)
 		goto out;
-	ret = sqlite3_bind_int(stmt, 2, val);
+	ret = sqlite3_bind_int64(stmt, 2, val);
 	if (ret)
 		goto out;
 	ret = sqlite3_step(stmt);
@@ -921,20 +921,7 @@ int dbfile_sync_config(struct dbhandle *db, struct dbfile_config *cfg)
 
 static int get_config_int(sqlite3_stmt *stmt, const char *name, int *val);
 static int get_config_int64(sqlite3_stmt *stmt, const char *name, int64_t *val);
-
-/* insert-or-replace one integer config key; leaves stmt reset for reuse. */
-static int put_config_int(sqlite3_stmt *stmt, const char *key, int64_t val)
-{
-	int ret;
-
-	sqlite3_reset(stmt);
-	ret = sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
-	if (!ret)
-		ret = sqlite3_bind_int64(stmt, 2, val);
-	if (!ret && sqlite3_step(stmt) != SQLITE_DONE)
-		ret = -1;
-	return ret;
-}
+static int sync_config_int(sqlite3_stmt *stmt, const char *key, int64_t val);
 
 /* Delete every row of `table`, then insert each of `n` strings in order. */
 static int replace_string_rows(sqlite3 *db, const char *insert_sql,
@@ -978,14 +965,14 @@ int dbfile_store_scan_config(struct dbhandle *dbh, const struct scan_config *sc)
 		goto err;
 
 	/* A marker row lets load distinguish "stored" from "never stored". */
-	if ((ret = put_config_int(stmt, "scan_config", 1)) ||
-	    (ret = put_config_int(stmt, "opt_run_dedupe", sc->run_dedupe)) ||
-	    (ret = put_config_int(stmt, "opt_recurse", sc->recurse)) ||
-	    (ret = put_config_int(stmt, "opt_skip_zeroes", sc->skip_zeroes)) ||
-	    (ret = put_config_int(stmt, "opt_only_whole_files", sc->only_whole_files)) ||
-	    (ret = put_config_int(stmt, "opt_do_block_hash", sc->do_block_hash)) ||
-	    (ret = put_config_int(stmt, "opt_dedupe_same_file", sc->dedupe_same_file)) ||
-	    (ret = put_config_int(stmt, "opt_min_filesize", (int64_t)sc->min_filesize)))
+	if ((ret = sync_config_int(stmt, "scan_config", 1)) ||
+	    (ret = sync_config_int(stmt, "opt_run_dedupe", sc->run_dedupe)) ||
+	    (ret = sync_config_int(stmt, "opt_recurse", sc->recurse)) ||
+	    (ret = sync_config_int(stmt, "opt_skip_zeroes", sc->skip_zeroes)) ||
+	    (ret = sync_config_int(stmt, "opt_only_whole_files", sc->only_whole_files)) ||
+	    (ret = sync_config_int(stmt, "opt_do_block_hash", sc->do_block_hash)) ||
+	    (ret = sync_config_int(stmt, "opt_dedupe_same_file", sc->dedupe_same_file)) ||
+	    (ret = sync_config_int(stmt, "opt_min_filesize", (int64_t)sc->min_filesize)))
 		goto err;
 
 	ret = replace_string_rows(db,
@@ -1181,29 +1168,12 @@ void dbfile_maybe_vacuum(struct dbhandle *db)
 
 static int get_config_int(sqlite3_stmt *stmt, const char *name, int *val)
 {
-	int ret;
+	int64_t v = val ? *val : 0;	/* preserve caller's default if no row */
+	int ret = get_config_int64(stmt, name, val ? &v : NULL);
 
-	if (!val)
-		return 0;
-
-	ret = sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
-	if (ret) {
-		perror_sqlite(ret, "retrieving row from config table (bind)");
-		return ret;
-	}
-
-	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-		*val = sqlite3_column_int(stmt, 0);
-	}
-
-	if (ret != SQLITE_DONE) {
-		perror_sqlite(ret, "retrieving row from config table (step)");
-		return ret;
-	}
-
-	sqlite3_reset(stmt);
-
-	return 0;
+	if (val)
+		*val = (int)v;
+	return ret;
 }
 
 static int get_config_int64(sqlite3_stmt *stmt, const char *name, int64_t *val)

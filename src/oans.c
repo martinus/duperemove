@@ -95,6 +95,46 @@ static const char *fmt_dur(char *buf, size_t n, double s)
  * tool): identity, contents, how much whole-file duplication it records, and
  * how long the load and the duplicate-analysis queries took on this hashfile.
  */
+/*
+ * Render a stored scan config's options as the CLI string a replay would use
+ * ("-r -d --min-filesize=... --dedupe-options=..."), or "(defaults)" if none.
+ * Kept next to the other scan-config policy so the flag spellings stay in one
+ * place. Caller frees the result.
+ */
+static char *scan_config_options_str(const struct scan_config *sc)
+{
+	GString *s = g_string_new(NULL);
+	const char *dtok[3];
+	int nd = 0, j;
+
+	if (sc->recurse)
+		g_string_append(s, "-r ");
+	if (sc->run_dedupe)
+		g_string_append(s, "-d ");
+	if (sc->skip_zeroes)
+		g_string_append(s, "--skip-zeroes ");
+	if (sc->min_filesize > 1)
+		g_string_append_printf(s, "--min-filesize=%"PRIu64" ", sc->min_filesize);
+
+	if (sc->only_whole_files)
+		dtok[nd++] = "only_whole_files";
+	if (sc->do_block_hash)
+		dtok[nd++] = "partial";
+	if (!sc->dedupe_same_file)
+		dtok[nd++] = "nosame";
+	if (nd) {
+		g_string_append(s, "--dedupe-options=");
+		for (j = 0; j < nd; j++)
+			g_string_append_printf(s, "%s%s", j ? "," : "", dtok[j]);
+	}
+
+	if (s->len && s->str[s->len - 1] == ' ')
+		g_string_truncate(s, s->len - 1);
+	if (!s->len)
+		g_string_append(s, "(defaults)");
+	return g_string_free(s, FALSE);		/* hand the buffer to the caller */
+}
+
 static int print_hashfile_stats(char *filename)
 {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
@@ -154,38 +194,12 @@ static int print_hashfile_stats(char *filename)
 		struct scan_config sc;
 
 		if (dbfile_load_scan_config(db, &sc) > 0) {
-			char opts[256] = "";
-			char dopt[64] = "";
-			size_t o = 0;
-
-			if (sc.recurse)
-				o += snprintf(opts + o, sizeof(opts) - o, "-r ");
-			if (sc.run_dedupe)
-				o += snprintf(opts + o, sizeof(opts) - o, "-d ");
-			if (sc.skip_zeroes)
-				o += snprintf(opts + o, sizeof(opts) - o, "--skip-zeroes ");
-			if (sc.min_filesize > 1)
-				o += snprintf(opts + o, sizeof(opts) - o,
-					      "--min-filesize=%"PRIu64" ", sc.min_filesize);
-			/* --dedupe-options: only the non-default tokens. */
-			if (sc.only_whole_files)
-				strcat(dopt, "only_whole_files,");
-			if (sc.do_block_hash)
-				strcat(dopt, "partial,");
-			if (!sc.dedupe_same_file)
-				strcat(dopt, "nosame,");
-			if (dopt[0]) {
-				dopt[strlen(dopt) - 1] = '\0';	/* drop trailing comma */
-				o += snprintf(opts + o, sizeof(opts) - o,
-					      "--dedupe-options=%s ", dopt);
-			}
-			if (o > 0 && opts[o - 1] == ' ')
-				opts[o - 1] = '\0';		/* drop trailing space */
+			char *opts = scan_config_options_str(&sc);
 
 			printf("\n%s%sstored scan%s   %s(replayed by: oans --hashfile=%s)%s\n",
 			       col_bold, col_blue, col_reset, col_dim, filename, col_reset);
-			printf("  %soptions%s         %s\n", col_dim, col_reset,
-			       opts[0] ? opts : "(defaults)");
+			printf("  %soptions%s         %s\n", col_dim, col_reset, opts);
+			free(opts);
 			for (i = 0; i < sc.nroots; i++)
 				printf("  %s%s%s %s\n", col_dim,
 				       i == 0 ? "paths      " : "           ",
@@ -930,28 +944,24 @@ static void apply_scan_config(const struct scan_config *sc)
  * survive is the caller's job: scanning zero roots would let the stat-based
  * prune wipe the whole hashfile (e.g. an unmounted drive).
  */
-static int drop_missing_roots(char **roots, int nroots)
+static int drop_missing_roots(struct scan_config *sc)
 {
 	int i, live = 0;
 
-	for (i = 0; i < nroots; i++) {
+	for (i = 0; i < sc->nroots; i++) {
 		struct stat st;
 
-		if (stat(roots[i], &st) == 0) {
-			roots[live++] = roots[i];
+		if (stat(sc->roots[i], &st) == 0) {
+			sc->roots[live++] = sc->roots[i];
 		} else {
 			eprintf("Warning: stored path \"%s\" no longer exists, "
-				"skipping.\n", roots[i]);
-			free(roots[i]);
+				"skipping.\n", sc->roots[i]);
+			free(sc->roots[i]);
 		}
 	}
-	/*
-	 * Compaction moved survivors to the front; NUL the vacated tail so the
-	 * caller's scan_config_free() (which frees all nroots slots) neither
-	 * double-frees a survivor nor touches a dropped string.
-	 */
-	for (i = live; i < nroots; i++)
-		roots[i] = NULL;
+	/* Shrink the count to the compacted survivors; scan_config_free() then
+	 * frees exactly those and nothing is double-freed or leaked. */
+	sc->nroots = live;
 	return live;
 }
 
@@ -1082,7 +1092,7 @@ int main(int argc, char **argv)
 		}
 
 		apply_scan_config(&replay);
-		numfiles = drop_missing_roots(replay.roots, replay.nroots);
+		numfiles = drop_missing_roots(&replay);
 		if (numfiles == 0) {
 			eprintf("Error: none of the stored paths exist; refusing "
 				"to run (this would prune the whole hashfile).\n");

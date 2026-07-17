@@ -20,10 +20,15 @@ class SelfDescribingConfigTest(DuperemoveTest):
         return self.hf_scalar(
             "select keyval from config where keyname=?", (name,))
 
-    def test_run_stores_options_and_roots(self):
-        d = self.path("tree")
+    def _seed_tree(self, name="tree", contents=b"x" * 4096):
+        """Create <name>/ holding one file; return the dir's absolute path."""
+        d = self.path(name)
         os.makedirs(d)
-        self.write("tree/a", b"x" * 4096)
+        self.write(f"{name}/a", contents)
+        return d
+
+    def test_run_stores_options_and_roots(self):
+        d = self._seed_tree()
 
         self.dm("-r", "--min-filesize=2048", d)
         self.assertDmOk()
@@ -36,9 +41,7 @@ class SelfDescribingConfigTest(DuperemoveTest):
         self.assertEqual(roots, [os.path.realpath(d)])
 
     def test_last_run_wins_overwrites(self):
-        d = self.path("tree")
-        os.makedirs(d)
-        self.write("tree/a", b"x" * 4096)
+        d = self._seed_tree()
 
         self.dm("-rd", d)
         self.assertEqual(self._opt("opt_run_dedupe"), 1)
@@ -48,6 +51,21 @@ class SelfDescribingConfigTest(DuperemoveTest):
         self.assertEqual(self._opt("opt_run_dedupe"), 0)
         self.assertEqual(self._opt("opt_dedupe_same_file"), 0)
 
+    def test_all_sticky_options_round_trip(self):
+        # Backstop: every scan-shaping option a run uses must be persisted, so
+        # adding a new one without wiring persist_scan_config fails here.
+        d = self._seed_tree(contents=b"x" * 16384)
+        self.dm("-rd", "--skip-zeroes", "--min-filesize=8192",
+                "--dedupe-options=nosame,only_whole_files", d)
+        self.assertDmOk()
+        self.assertEqual(self._opt("opt_run_dedupe"), 1)
+        self.assertEqual(self._opt("opt_recurse"), 1)
+        self.assertEqual(self._opt("opt_skip_zeroes"), 1)
+        self.assertEqual(self._opt("opt_only_whole_files"), 1)
+        self.assertEqual(self._opt("opt_dedupe_same_file"), 0)   # nosame
+        self.assertEqual(self._opt("opt_do_block_hash"), 0)      # not requested
+        self.assertEqual(self._opt("opt_min_filesize"), 8192)
+
     def test_bare_run_without_stored_config_errors(self):
         # Fresh hashfile, no arguments: nothing to replay.
         self.dm()
@@ -55,9 +73,7 @@ class SelfDescribingConfigTest(DuperemoveTest):
         self.assertIn("no stored scan configuration", self.out)
 
     def test_all_roots_missing_refuses_and_keeps_rows(self):
-        d = self.path("tree")
-        os.makedirs(d)
-        self.write("tree/a", b"x" * 4096)
+        d = self._seed_tree()
         self.dm("-r", d)
         rows_before = self.hf_count("files")
         self.assertGreater(rows_before, 0)
