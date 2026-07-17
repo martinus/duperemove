@@ -110,14 +110,12 @@ static int print_hashfile_stats(char *filename)
 	char uuid_str[37] = "";
 	char htype[9] = "", b1[16], b2[16];
 	int k, ntop = 0, i;
-	uint64_t files, hashed, unhashed, logical, app_id;
-	uint64_t groups, dupfiles, reclaim;
-	uint64_t page_size, page_count, freelist, largest, median;
+	uint64_t files = 0, hashed = 0, unhashed, logical = 0, app_id, largest = 0, median;
+	uint64_t groups = 0, dupfiles = 0, reclaim = 0;
+	uint64_t page_size, page_count, freelist;
 	double t0, t_load, t_analysis;
 	sqlite3 *sq;
 
-	/* --- load: open the hashfile and read its header + counts --- */
-	t0 = g_get_monotonic_time() / 1e6;
 	db = dbfile_open_handle(filename);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", filename);
@@ -126,7 +124,12 @@ static int print_hashfile_stats(char *filename)
 	sq = db->db;
 	if (dbfile_get_config(sq, &cfg))
 		return -1;
-	dbfile_get_stats(db, &st);
+
+	/*
+	 * Print each section as its data becomes ready, so on a large hashfile
+	 * the identity shows instantly instead of after the whole (seconds-long)
+	 * analysis. --- identity: config + a few pragmas, effectively free. ---
+	 */
 	uuid_unparse(cfg.fs_uuid, uuid_str);
 	memcpy(htype, cfg.hash_type, 8);
 	for (k = 7; k >= 0 && (htype[k] == ' ' || htype[k] == '\0'); k--)
@@ -135,53 +138,7 @@ static int print_hashfile_stats(char *filename)
 	page_size = stats_u64(sq, "PRAGMA page_size");
 	page_count = stats_u64(sq, "PRAGMA page_count");
 	freelist = stats_u64(sq, "PRAGMA freelist_count");
-	files    = stats_u64(sq, "select count(*) from files");
-	hashed   = stats_u64(sq, "select count(*) from files where digest is not null");
-	unhashed = files - hashed;
-	logical  = stats_u64(sq, "select ifnull(sum(size),0) from files");
-	largest  = stats_u64(sq, "select ifnull(max(size),0) from files");
-	median   = stats_u64(sq, "select size from files order by size "
-		"limit 1 offset (select (count(*)-1)/2 from files)");
-	t_load = g_get_monotonic_time() / 1e6 - t0;
 
-	/* --- duplicate analysis: the group-by over (digest, size) --- */
-	t0 = g_get_monotonic_time() / 1e6;
-	groups   = stats_u64(sq, "select count(*) from (select 1 from files "
-		"where digest is not null group by digest, size having count(*) > 1)");
-	dupfiles = stats_u64(sq, "select ifnull(sum(c),0) from (select count(*) c "
-		"from files where digest is not null group by digest, size having c > 1)");
-	reclaim  = stats_u64(sq, "select ifnull(sum((c-1)*size),0) from (select size, "
-		"count(*) c from files where digest is not null group by digest, size having c > 1)");
-	{
-		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
-
-		/*
-		 * The example is the group's shortest path (ties broken
-		 * alphabetically): usually the canonical copy, and the least
-		 * nested / most readable. min() over a fixed-width length prefix
-		 * picks it; substr() then strips the 10-char prefix back off.
-		 */
-		if (sqlite3_prepare_v2(sq,
-			"select size, count(*) c, "
-			"substr(min(printf('%010d', length(filename)) || filename), 11), "
-			"(count(*)-1)*size w "
-			"from files where digest is not null "
-			"group by digest, size having c > 1 "
-			"order by w desc, size desc limit 10", -1, &s, NULL) == SQLITE_OK) {
-			while (ntop < 10 && sqlite3_step(s) == SQLITE_ROW) {
-				const char *fn = (const char *)sqlite3_column_text(s, 2);
-
-				top[ntop].size = sqlite3_column_int64(s, 0);
-				top[ntop].count = sqlite3_column_int64(s, 1);
-				top[ntop].path = fn ? strdup(fn) : NULL;
-				top[ntop].waste = sqlite3_column_int64(s, 3);
-				ntop++;
-			}
-		}
-	}
-	t_analysis = g_get_monotonic_time() / 1e6 - t0;
-
-	/* --- report --- */
 	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
 	if (stat(filename, &sb) == 0)
 		printf("  %s(%s on disk)%s", col_dim, human_size(sb.st_size), col_reset);
@@ -195,6 +152,28 @@ static int print_hashfile_stats(char *filename)
 		printf("  %sfree space%s      %s   %s(%.1f%% of the file, reclaimed by a VACUUM)%s\n",
 		       col_dim, col_reset, human_size(freelist * page_size),
 		       col_dim, 100.0 * freelist / page_count, col_reset);
+	fflush(stdout);
+
+	/* --- files: one scan for the counts + sizes, plus the median sort --- */
+	t0 = g_get_monotonic_time() / 1e6;
+	dbfile_get_stats(db, &st);
+	{
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+
+		if (sqlite3_prepare_v2(sq, "select count(*), "
+			"ifnull(sum(digest is not null),0), ifnull(sum(size),0), "
+			"ifnull(max(size),0) from files", -1, &s, NULL) == SQLITE_OK
+		    && sqlite3_step(s) == SQLITE_ROW) {
+			files = sqlite3_column_int64(s, 0);
+			hashed = sqlite3_column_int64(s, 1);
+			logical = sqlite3_column_int64(s, 2);
+			largest = sqlite3_column_int64(s, 3);
+		}
+	}
+	unhashed = files - hashed;
+	median = stats_u64(sq, "select size from files order by size "
+		"limit 1 offset (select (count(*)-1)/2 from files)");
+	t_load = g_get_monotonic_time() / 1e6 - t0;
 
 	printf("\n%s%sfiles%s\n", col_bold, col_blue, col_reset);
 	printf("  %stracked%s         %"PRIu64"\n", col_dim, col_reset, files);
@@ -209,6 +188,48 @@ static int print_hashfile_stats(char *filename)
 	       human_size(files ? logical / files : 0));
 	printf(" %s·%s median %s", col_dim, col_reset, human_size(median));
 	printf(" %s·%s largest %s\n", col_dim, col_reset, human_size(largest));
+	fflush(stdout);
+
+	/* --- whole-file duplicates: ONE group-by feeds every figure below --- */
+	t0 = g_get_monotonic_time() / 1e6;
+	{
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+
+		/*
+		 * A single pass over the files table yields every duplicate group
+		 * (digest, size); we accumulate the totals and keep the top 10 by
+		 * reclaimable bytes - far cheaper than one scan per figure. The
+		 * example path is the group's shortest (ties alphabetical), usually
+		 * the canonical least-nested copy: min() over a fixed-width length
+		 * prefix picks it, substr() strips the prefix.
+		 */
+		if (sqlite3_prepare_v2(sq,
+			"select size, count(*) c, "
+			"substr(min(printf('%010d', length(filename)) || filename), 11), "
+			"(count(*)-1)*size w "
+			"from files where digest is not null "
+			"group by digest, size having c > 1 "
+			"order by w desc, size desc", -1, &s, NULL) == SQLITE_OK) {
+			while (sqlite3_step(s) == SQLITE_ROW) {
+				uint64_t c = sqlite3_column_int64(s, 1);
+				uint64_t w = sqlite3_column_int64(s, 3);
+
+				groups++;
+				dupfiles += c;
+				reclaim += w;
+				if (ntop < 10) {
+					const char *fn = (const char *)sqlite3_column_text(s, 2);
+
+					top[ntop].size = sqlite3_column_int64(s, 0);
+					top[ntop].count = c;
+					top[ntop].waste = w;
+					top[ntop].path = fn ? strdup(fn) : NULL;
+					ntop++;
+				}
+			}
+		}
+	}
+	t_analysis = g_get_monotonic_time() / 1e6 - t0;
 
 	printf("\n%s%swhole-file duplicates%s\n", col_bold, col_blue, col_reset);
 	printf("  %sgroups%s          %"PRIu64"\n", col_dim, col_reset, groups);
@@ -229,6 +250,7 @@ static int print_hashfile_stats(char *filename)
 		       top[i].path ? top[i].path : "");
 		free(top[i].path);
 	}
+	fflush(stdout);
 
 	printf("\n%s%stiming%s\n", col_bold, col_blue, col_reset);
 	printf("  %sload%s            %s\n", col_dim, col_reset,
