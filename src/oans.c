@@ -26,6 +26,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <sys/stat.h>
 
 #include <glib.h>
 
@@ -52,6 +53,7 @@ unsigned int blocksize = DEFAULT_BLOCKSIZE;
 static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
+static unsigned int stats_only_opt = 0;
 static int opt_no_color = 0;
 struct dbfile_config dbfile_cfg;
 
@@ -70,6 +72,222 @@ static void print_file(char *filename, char *ino, char *subvol)
 		printf("%s\t%s\t%s\n", filename, ino, subvol);
 	else
 		printf("%s\n", filename);
+}
+
+static uint64_t stats_u64(sqlite3 *db, const char *sql)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	uint64_t v = 0;
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+	    sqlite3_step(stmt) == SQLITE_ROW)
+		v = sqlite3_column_int64(stmt, 0);
+	return v;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Human duration for the timing lines: ms under a second, else seconds. */
+static const char *fmt_dur(char *buf, size_t n, double s)
+{
+	if (s < 1.0)
+		snprintf(buf, n, "%.0f ms", s * 1000.0);
+	else
+		snprintf(buf, n, "%.2f s", s);
+	return buf;
+}
+
+/*
+ * Print a human-readable report about a hashfile (folds in the old hashstats
+ * tool): identity, contents, how much whole-file duplication it records, and
+ * how long the load and the duplicate-analysis queries took on this hashfile.
+ */
+static int print_hashfile_stats(char *filename)
+{
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
+	struct dbfile_config cfg;
+	struct dbfile_stats st = {0};
+	struct stat sb;
+	struct topgrp { uint64_t size, count, waste; char *path; } top[10];
+	char uuid_str[37] = "";
+	char htype[9] = "", b1[16], b2[16];
+	int k, ntop = 0, i;
+	uint64_t files = 0, hashed = 0, unhashed, logical = 0, app_id, largest = 0, median;
+	uint64_t groups = 0, dupfiles = 0, reclaim = 0;
+	uint64_t page_size, page_count, freelist;
+	double t0, t_load, t_analysis;
+	sqlite3 *sq;
+
+	db = dbfile_open_handle(filename);
+	if (!db) {
+		eprintf("Error: Could not open \"%s\"\n", filename);
+		return -1;
+	}
+	sq = db->db;
+	if (dbfile_get_config(sq, &cfg))
+		return -1;
+
+	/*
+	 * Print each section as its data becomes ready, so on a large hashfile
+	 * the identity shows instantly instead of after the whole (seconds-long)
+	 * analysis. --- identity: config + a few pragmas, effectively free. ---
+	 */
+	uuid_unparse(cfg.fs_uuid, uuid_str);
+	memcpy(htype, cfg.hash_type, 8);
+	for (k = 7; k >= 0 && (htype[k] == ' ' || htype[k] == '\0'); k--)
+		htype[k] = '\0';
+	app_id = stats_u64(sq, "PRAGMA application_id");
+	page_size = stats_u64(sq, "PRAGMA page_size");
+	page_count = stats_u64(sq, "PRAGMA page_count");
+	freelist = stats_u64(sq, "PRAGMA freelist_count");
+
+	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
+	if (stat(filename, &sb) == 0)
+		printf("  %s(%s on disk)%s", col_dim, human_size(sb.st_size), col_reset);
+	printf("\n");
+	printf("  %sformat%s          %d.%d%s\n", col_dim, col_reset, cfg.major,
+	       cfg.minor, app_id == OANS_APP_ID ? "  (oans)" : "");
+	printf("  %shashing%s         %s, %s blocks\n", col_dim, col_reset,
+	       htype, human_size(cfg.blocksize));
+	printf("  %sfilesystem%s      %s\n", col_dim, col_reset, uuid_str);
+	if (page_count > 0)
+		printf("  %sfree space%s      %s   %s(%.1f%% of the file, reclaimed by a VACUUM)%s\n",
+		       col_dim, col_reset, human_size(freelist * page_size),
+		       col_dim, 100.0 * freelist / page_count, col_reset);
+	fflush(stdout);
+
+	/*
+	 * files: one scan reads every size into an array, from which we get
+	 * count/hashed/logical/largest and (after a fast C sort) the median. An
+	 * in-memory qsort beats a second SQLite "order by size" over millions of
+	 * rows, which is otherwise the most expensive query in the report.
+	 */
+	t0 = g_get_monotonic_time() / 1e6;
+	dbfile_get_stats(db, &st);
+	median = 0;
+	files = stats_u64(sq, "select count(*) from files");
+	{
+		uint64_t *sizes = files ? malloc(files * sizeof(*sizes)) : NULL;
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+		size_t n = 0;
+
+		if (sizes && sqlite3_prepare_v2(sq,
+			"select size, digest is not null from files",
+			-1, &s, NULL) == SQLITE_OK) {
+			while (n < files && sqlite3_step(s) == SQLITE_ROW) {
+				uint64_t sz = sqlite3_column_int64(s, 0);
+
+				sizes[n++] = sz;
+				logical += sz;
+				if (sz > largest)
+					largest = sz;
+				if (sqlite3_column_int(s, 1))
+					hashed++;
+			}
+			qsort(sizes, n, sizeof(*sizes), cmp_u64);
+			median = n ? sizes[n / 2] : 0;
+		} else {
+			/* OOM: fall back to per-figure queries (median sorts in SQL). */
+			hashed  = stats_u64(sq, "select count(*) from files where digest is not null");
+			logical = stats_u64(sq, "select ifnull(sum(size),0) from files");
+			largest = stats_u64(sq, "select ifnull(max(size),0) from files");
+			median  = stats_u64(sq, "select size from files order by size "
+				"limit 1 offset (select (count(*)-1)/2 from files)");
+		}
+		free(sizes);
+	}
+	unhashed = files - hashed;
+	t_load = g_get_monotonic_time() / 1e6 - t0;
+
+	printf("\n%s%sfiles%s\n", col_bold, col_blue, col_reset);
+	printf("  %stracked%s         %"PRIu64"\n", col_dim, col_reset, files);
+	printf("  %shashed%s          %"PRIu64"\n", col_dim, col_reset, hashed);
+	if (unhashed)
+		printf("  %sunread%s          %"PRIu64"   %s(unique size, whole-file mode)%s\n",
+		       col_dim, col_reset, unhashed, col_dim, col_reset);
+	printf("  %sextent hashes%s   %"PRIu64"\n", col_dim, col_reset, st.num_e_hashes);
+	printf("  %sblock hashes%s    %"PRIu64"\n", col_dim, col_reset, st.num_b_hashes);
+	printf("  %slogical data%s    %s\n", col_dim, col_reset, human_size(logical));
+	printf("  %sfile sizes%s      avg %s", col_dim, col_reset,
+	       human_size(files ? logical / files : 0));
+	printf(" %s·%s median %s", col_dim, col_reset, human_size(median));
+	printf(" %s·%s largest %s\n", col_dim, col_reset, human_size(largest));
+	fflush(stdout);
+
+	/* --- whole-file duplicates: ONE group-by feeds every figure below --- */
+	t0 = g_get_monotonic_time() / 1e6;
+	{
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+
+		/*
+		 * A single pass over the files table yields every duplicate group
+		 * (digest, size); we accumulate the totals and keep the top 10 by
+		 * reclaimable bytes - far cheaper than one scan per figure. The
+		 * example path is the group's shortest (ties alphabetical), usually
+		 * the canonical least-nested copy: min() over a fixed-width length
+		 * prefix picks it, substr() strips the prefix.
+		 */
+		if (sqlite3_prepare_v2(sq,
+			"select size, count(*) c, "
+			"substr(min(printf('%010d', length(filename)) || filename), 11), "
+			"(count(*)-1)*size w "
+			"from files where digest is not null "
+			"group by digest, size having c > 1 "
+			"order by w desc, size desc", -1, &s, NULL) == SQLITE_OK) {
+			while (sqlite3_step(s) == SQLITE_ROW) {
+				uint64_t c = sqlite3_column_int64(s, 1);
+				uint64_t w = sqlite3_column_int64(s, 3);
+
+				groups++;
+				dupfiles += c;
+				reclaim += w;
+				if (ntop < 10) {
+					const char *fn = (const char *)sqlite3_column_text(s, 2);
+
+					top[ntop].size = sqlite3_column_int64(s, 0);
+					top[ntop].count = c;
+					top[ntop].waste = w;
+					top[ntop].path = fn ? strdup(fn) : NULL;
+					ntop++;
+				}
+			}
+		}
+	}
+	t_analysis = g_get_monotonic_time() / 1e6 - t0;
+
+	printf("\n%s%swhole-file duplicates%s\n", col_bold, col_blue, col_reset);
+	printf("  %sgroups%s          %"PRIu64"\n", col_dim, col_reset, groups);
+	printf("  %sfiles in groups%s %"PRIu64"\n", col_dim, col_reset, dupfiles);
+	printf("  %sreclaimable%s     %s%s%s   %s(%.1f%% of tracked data)%s\n",
+	       col_dim, col_reset, col_green, human_size(reclaim), col_reset,
+	       col_dim, logical ? 100.0 * reclaim / logical : 0.0, col_reset);
+	if (ntop)
+		printf("  %stop groups%s      %ssize x copies · reclaimable · example%s\n",
+		       col_dim, col_reset, col_dim, col_reset);
+	for (i = 0; i < ntop; i++) {
+		char szb[48], wb[32];
+
+		snprintf(szb, sizeof(szb), "%s x %"PRIu64, human_size(top[i].size),
+			 top[i].count);
+		snprintf(wb, sizeof(wb), "%s", human_size(top[i].waste));
+		printf("    %-18s %s%10s%s  %s\n", szb, col_dim, wb, col_reset,
+		       top[i].path ? top[i].path : "");
+		free(top[i].path);
+	}
+	fflush(stdout);
+
+	printf("\n%s%stiming%s\n", col_bold, col_blue, col_reset);
+	printf("  %sload%s            %s\n", col_dim, col_reset,
+	       fmt_dur(b1, sizeof(b1), t_load));
+	printf("  %sdup analysis%s    %s   %s(the group-by over %"PRIu64" files)%s\n",
+	       col_dim, col_reset, fmt_dur(b2, sizeof(b2), t_analysis),
+	       col_dim, hashed, col_reset);
+	return 0;
 }
 
 static int list_db_files(char *filename)
@@ -210,6 +428,7 @@ enum {
 	BATCH_SIZE_OPTION,
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
+	STATS_OPTION,
 };
 
 static int process_fdupes(void)
@@ -324,6 +543,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
+		{ "stats", 0, NULL, STATS_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -406,6 +626,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case 'R':
 			rm_only_opt = 1;
+			break;
+		case STATS_OPTION:
+			stats_only_opt = 1;
 			break;
 		case QUIET_OPTION:
 		case 'q':
@@ -503,26 +726,26 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	if (list_only_opt && rm_only_opt) {
-		eprintf("Error: Can not mix '-L' and '-R' options.\n");
+	if (list_only_opt + rm_only_opt + stats_only_opt > 1) {
+		eprintf("Error: use only one of '-L', '-R', '--stats'.\n");
 		return 1;
 	}
 
-	if (list_only_opt || rm_only_opt) {
+	if (list_only_opt || rm_only_opt || stats_only_opt) {
 		if (!options.hashfile || use_hashfile == H_WRITE) {
 			eprintf("Error: --hashfile= option is required "
-				"with '-L' or -R.\n");
+				"with '-L', '-R' or '--stats'.\n");
 			return 1;
 		}
 
-		if (list_only_opt && numfiles) {
-			eprintf("Error: -L option do not take "
+		if ((list_only_opt || stats_only_opt) && numfiles) {
+			eprintf("Error: -L/--stats do not take "
 				"a file list argument\n");
 			return 1;
 		}
 	}
 
-	if (!(options.fdupes_mode || list_only_opt)
+	if (!(options.fdupes_mode || list_only_opt || stats_only_opt)
 			&& numfiles == 0) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
@@ -782,6 +1005,8 @@ int main(int argc, char **argv)
 		return list_db_files(options.hashfile);
 	else if (rm_only_opt)
 		return rm_db_files(argc - filelist_idx, &argv[filelist_idx]);
+	else if (stats_only_opt)
+		return print_hashfile_stats(options.hashfile);
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)

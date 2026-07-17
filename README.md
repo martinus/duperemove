@@ -121,9 +121,9 @@ reclaimed space, compare `compsize` **Disk Usage** before and after a run;
 - libbsd (`libbsd-dev` on Debian)
 
 ```sh
-make            # build oans + helpers
+make            # build oans
 make check      # C unit tests + Python integration suite
-sudo make install   # installs oans, a duperemove compat symlink, and helpers
+sudo make install   # installs oans + a duperemove compat symlink
 ```
 
 Sources live under `src/`; man page sources under `docs/man/`; the integration
@@ -147,6 +147,9 @@ oans -dhr file1 file2 dir1/
 
 # Recursively dedupe a tree, reusing a hashfile across runs:
 oans -dr --hashfile=/path/to/hashfile /my/data
+
+# Report what a hashfile holds (files, hashes, duplication):
+oans --stats --hashfile=/path/to/hashfile
 ```
 
 A run ends with a summary like:
