@@ -131,6 +131,21 @@ int dbfile_store_scan_config(struct dbhandle *db, const struct scan_config *sc);
 int dbfile_load_scan_config(struct dbhandle *db, struct scan_config *sc);
 void scan_config_free(struct scan_config *sc);
 
+/*
+ * One recorded run, appended to the hashfile's run_history at the end of each
+ * invocation (see dbfile_record_run). Fed to --history and the --json export.
+ */
+struct run_record {
+	int64_t		ts;		/* unix seconds */
+	int64_t		duration_ms;
+	uint64_t	files_scanned;
+	uint64_t	reclaimed;	/* bytes: net change in shared extents */
+	uint64_t	groups;
+	uint64_t	kernel_bytes;
+	int		deduped;	/* 1 if -d, 0 for a scan-only run */
+};
+int dbfile_record_run(struct dbhandle *db, const struct run_record *r);
+
 struct dbfile_stats {
 	uint64_t	num_b_hashes;
 	uint64_t	num_e_hashes;

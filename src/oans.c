@@ -26,6 +26,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include <glib.h>
@@ -54,6 +55,8 @@ static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
+static unsigned int history_only_opt = 0;
+static unsigned int json_only_opt = 0;
 static int opt_no_color = 0;
 
 /* User-supplied --exclude patterns, captured for the self-describing hashfile
@@ -342,6 +345,154 @@ static int print_hashfile_stats(char *filename)
 	return 0;
 }
 
+/* Whole-file duplicate totals (logical): groups, files in them, and the
+ * reclaimable logical bytes. Shared by --stats-style callers and --json. */
+static void compute_dup_summary(sqlite3 *sq, uint64_t *groups,
+				uint64_t *dupfiles, uint64_t *reclaim)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+
+	*groups = *dupfiles = *reclaim = 0;
+	if (sqlite3_prepare_v2(sq,
+		"select count(*) c, (count(*)-1)*size w from files "
+		"where digest is not null group by digest, size having c > 1",
+		-1, &s, NULL) != SQLITE_OK)
+		return;
+	while (sqlite3_step(s) == SQLITE_ROW) {
+		(*groups)++;
+		*dupfiles += sqlite3_column_int64(s, 0);
+		*reclaim += sqlite3_column_int64(s, 1);
+	}
+}
+
+/* Print s as a JSON string literal (quotes + minimal escaping). */
+static void print_json_str(const char *s)
+{
+	putchar('"');
+	for (; *s; s++) {
+		unsigned char c = (unsigned char)*s;
+
+		if (c == '"' || c == '\\')
+			printf("\\%c", c);
+		else if (c < 0x20)
+			printf("\\u%04x", c);
+		else
+			putchar(c);
+	}
+	putchar('"');
+}
+
+static int print_hashfile_history(char *filename)
+{
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	uint64_t runs, total_reclaimed, total_files;
+	int64_t first_ts;
+	sqlite3 *sq;
+
+	db = dbfile_open_handle(filename);
+	if (!db) {
+		eprintf("Error: Could not open \"%s\"\n", filename);
+		return -1;
+	}
+	sq = db->db;
+
+	runs = dbfile_query_u64(sq, "select count(*) from run_history");
+	printf("%s%soans history%s  %s\n", col_bold, col_blue, col_reset, filename);
+	if (runs == 0) {
+		printf("  %sno runs recorded yet%s\n", col_dim, col_reset);
+		return 0;
+	}
+	total_reclaimed = dbfile_query_u64(sq, "select ifnull(sum(reclaimed),0) from run_history");
+	total_files = dbfile_query_u64(sq, "select ifnull(sum(files_scanned),0) from run_history");
+	first_ts = dbfile_query_u64(sq, "select ifnull(min(ts),0) from run_history");
+
+	{
+		char since[32];
+		time_t t = (time_t)first_ts;
+		struct tm tm;
+
+		localtime_r(&t, &tm);
+		strftime(since, sizeof(since), "%Y-%m-%d", &tm);
+		printf("  %ssince%s        %s  %s(%"PRIu64" run%s)%s\n", col_dim,
+		       col_reset, since, col_dim, runs, runs == 1 ? "" : "s",
+		       col_reset);
+	}
+	printf("  %sreclaimed%s    %s%s%s total\n", col_dim, col_reset, col_green,
+	       human_size(total_reclaimed), col_reset);
+	printf("  %sfiles seen%s   %"PRIu64" %s(cumulative)%s\n", col_dim, col_reset,
+	       total_files, col_dim, col_reset);
+
+	printf("\n  %srecent%s   %sdate · reclaimed · elapsed · files · mode%s\n",
+	       col_dim, col_reset, col_dim, col_reset);
+	if (sqlite3_prepare_v2(sq,
+		"select ts, reclaimed, duration_ms, files_scanned, deduped "
+		"from run_history order by ts desc limit 20", -1, &stmt, NULL) == SQLITE_OK) {
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			char when[32];
+			time_t t = (time_t)sqlite3_column_int64(stmt, 0);
+			struct tm tm;
+
+			localtime_r(&t, &tm);
+			strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
+			printf("    %s  %10s  %7.1fs  %9"PRIu64"  %s\n", when,
+			       human_size(sqlite3_column_int64(stmt, 1)),
+			       sqlite3_column_int64(stmt, 2) / 1000.0,
+			       (uint64_t)sqlite3_column_int64(stmt, 3),
+			       sqlite3_column_int(stmt, 4) ? "dedupe" : "scan");
+		}
+	}
+	return 0;
+}
+
+static int print_metrics_json(char *filename)
+{
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
+	struct dbfile_config cfg;
+	struct dbfile_stats st = {0};
+	uint64_t logical, hashed, groups, dupfiles, reclaimable;
+	uint64_t runs, reclaimed_total;
+	int64_t last_ts;
+	sqlite3 *sq;
+
+	db = dbfile_open_handle(filename);
+	if (!db) {
+		eprintf("Error: Could not open \"%s\"\n", filename);
+		return -1;
+	}
+	sq = db->db;
+	if (dbfile_get_config(sq, &cfg))
+		return -1;
+	dbfile_get_stats(db, &st);
+
+	logical = dbfile_query_u64(sq, "select ifnull(sum(size),0) from files");
+	hashed = dbfile_query_u64(sq, "select count(*) from files where digest is not null");
+	compute_dup_summary(sq, &groups, &dupfiles, &reclaimable);
+	runs = dbfile_query_u64(sq, "select count(*) from run_history");
+	reclaimed_total = dbfile_query_u64(sq, "select ifnull(sum(reclaimed),0) from run_history");
+	last_ts = dbfile_query_u64(sq, "select ifnull(max(ts),0) from run_history");
+
+	printf("{\n  \"hashfile\": ");
+	print_json_str(filename);
+	printf(",\n");
+	printf("  \"format\": \"%d.%d\",\n", cfg.major, cfg.minor);
+	printf("  \"block_size\": %u,\n", cfg.blocksize);
+	printf("  \"files_tracked\": %"PRIu64",\n", st.num_files);
+	printf("  \"files_hashed\": %"PRIu64",\n", hashed);
+	printf("  \"extent_hashes\": %"PRIu64",\n", st.num_e_hashes);
+	printf("  \"block_hashes\": %"PRIu64",\n", st.num_b_hashes);
+	printf("  \"logical_bytes\": %"PRIu64",\n", logical);
+	printf("  \"dup_groups\": %"PRIu64",\n", groups);
+	printf("  \"dup_files\": %"PRIu64",\n", dupfiles);
+	/* Logical upper bound; real disk freed is smaller on compressed fs. */
+	printf("  \"reclaimable_logical_bytes\": %"PRIu64",\n", reclaimable);
+	printf("  \"runs\": %"PRIu64",\n", runs);
+	printf("  \"reclaimed_total_bytes\": %"PRIu64",\n", reclaimed_total);
+	printf("  \"last_run_ts\": %"PRId64"\n", last_ts);
+	printf("}\n");
+	return 0;
+}
+
 static int list_db_files(char *filename)
 {
 	int ret;
@@ -487,6 +638,8 @@ enum {
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
 	STATS_OPTION,
+	HISTORY_OPTION,
+	JSON_OPTION,
 };
 
 static int add_one_stdin_file(char *path, void *db)
@@ -551,6 +704,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
 		{ "stats", 0, NULL, STATS_OPTION },
+		{ "history", 0, NULL, HISTORY_OPTION },
+		{ "json", 0, NULL, JSON_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -624,6 +779,12 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case STATS_OPTION:
 			stats_only_opt = 1;
 			break;
+		case HISTORY_OPTION:
+			history_only_opt = 1;
+			break;
+		case JSON_OPTION:
+			json_only_opt = 1;
+			break;
 		case QUIET_OPTION:
 		case 'q':
 			quiet = 1;
@@ -688,20 +849,25 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	if (list_only_opt + rm_only_opt + stats_only_opt > 1) {
-		eprintf("Error: use only one of '-L', '-R', '--stats'.\n");
+	/* -L/-R/--stats/--history/--json are exclusive read-only report modes. */
+	if (list_only_opt + rm_only_opt + stats_only_opt + history_only_opt
+			+ json_only_opt > 1) {
+		eprintf("Error: use only one of '-L', '-R', '--stats', "
+			"'--history', '--json'.\n");
 		return 1;
 	}
 
-	if (list_only_opt || rm_only_opt || stats_only_opt) {
+	if (list_only_opt || rm_only_opt || stats_only_opt || history_only_opt
+			|| json_only_opt) {
 		if (!options.hashfile) {
-			eprintf("Error: --hashfile= option is required "
-				"with '-L', '-R' or '--stats'.\n");
+			eprintf("Error: --hashfile= option is required with "
+				"'-L', '-R', '--stats', '--history' or '--json'.\n");
 			return 1;
 		}
 
-		if ((list_only_opt || stats_only_opt) && numfiles) {
-			eprintf("Error: -L/--stats do not take "
+		/* Only -R consumes a file list; the report modes do not. */
+		if (!rm_only_opt && numfiles) {
+			eprintf("Error: -L/--stats/--history/--json do not take "
 				"a file list argument\n");
 			return 1;
 		}
@@ -712,7 +878,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	 * scan config stored in the hashfile. Without a hashfile there is nothing
 	 * to replay, so a file list is still required.
 	 */
-	if (!(list_only_opt || stats_only_opt)
+	if (!(list_only_opt || stats_only_opt || history_only_opt || json_only_opt)
 			&& numfiles == 0 && !options.hashfile) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
@@ -1011,6 +1177,7 @@ int main(int argc, char **argv)
 	int numfiles;
 	char **roots;
 	bool replaying = false;
+	uint64_t files_scanned = 0;
 	struct scan_config replay = {0};
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 
@@ -1057,6 +1224,10 @@ int main(int argc, char **argv)
 		return rm_db_files(argc - filelist_idx, &argv[filelist_idx]);
 	else if (stats_only_opt)
 		return print_hashfile_stats(options.hashfile);
+	else if (history_only_opt)
+		return print_hashfile_history(options.hashfile);
+	else if (json_only_opt)
+		return print_metrics_json(options.hashfile);
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)
@@ -1117,6 +1288,9 @@ int main(int argc, char **argv)
 	if (ret)
 		goto out;
 
+	/* Capture now: the dedupe phase reuses the scan progress counters. */
+	files_scanned = pscan_files_scanned();
+
 	/* Remember this run so a later bare `oans --hashfile=X` replays it. */
 	if (!replaying && !stdin_filelist && options.hashfile)
 		persist_scan_config(db, roots, numfiles);
@@ -1140,6 +1314,24 @@ int main(int argc, char **argv)
 		qprintf("Hashfile \"%s\" written\n", options.hashfile);
 
 	process_duplicates(db);
+
+	/* Append this run to the hashfile's history (fuels --history / --json). */
+	if (options.hashfile) {
+		uint64_t groups = 0, reclaimed = 0, kern = 0;
+		struct run_record rec;
+
+		pdedupe_counters(&groups, &reclaimed, &kern);
+		rec = (struct run_record){
+			.ts = time(NULL),
+			.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
+			.files_scanned = files_scanned,
+			.reclaimed = reclaimed,
+			.groups = groups,
+			.kernel_bytes = kern,
+			.deduped = options.run_dedupe,
+		};
+		dbfile_record_run(db, &rec);
+	}
 
 	/* Reclaim space if a prune this run left the hashfile mostly free. */
 	if (options.hashfile)

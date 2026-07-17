@@ -269,6 +269,20 @@ static int create_tables(sqlite3 *db)
 #define CREATE_TABLE_SCAN_EXCLUDES					\
 "CREATE TABLE IF NOT EXISTS scan_excludes(pattern TEXT NOT NULL);"
 	ret = sqlite3_exec(db, CREATE_TABLE_SCAN_EXCLUDES, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	/*
+	 * One row per oans run (see dbfile_record_run): a timeline of what each
+	 * run reclaimed, for `--history` and the `--json` metrics export.
+	 */
+#define CREATE_TABLE_RUN_HISTORY					\
+"CREATE TABLE IF NOT EXISTS run_history("				\
+"ts INTEGER NOT NULL, duration_ms INTEGER NOT NULL, "			\
+"files_scanned INTEGER NOT NULL, reclaimed INTEGER NOT NULL, "		\
+"groups INTEGER NOT NULL, kernel_bytes INTEGER NOT NULL, "		\
+"deduped INTEGER NOT NULL);"
+	ret = sqlite3_exec(db, CREATE_TABLE_RUN_HISTORY, NULL, NULL, NULL);
 
 out:
 	if (ret)
@@ -1093,6 +1107,34 @@ void scan_config_free(struct scan_config *sc)
 		free(sc->excludes[i]);
 	free(sc->excludes);
 	memset(sc, 0, sizeof(*sc));
+}
+
+int dbfile_record_run(struct dbhandle *dbh, const struct run_record *r)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	int ret;
+
+	ret = sqlite3_prepare_v2(dbh->db,
+		"insert into run_history(ts, duration_ms, files_scanned, "
+		"reclaimed, groups, kernel_bytes, deduped) "
+		"values (?1, ?2, ?3, ?4, ?5, ?6, ?7)", -1, &stmt, NULL);
+	if (ret)
+		goto out;
+
+	sqlite3_bind_int64(stmt, 1, r->ts);
+	sqlite3_bind_int64(stmt, 2, r->duration_ms);
+	sqlite3_bind_int64(stmt, 3, r->files_scanned);
+	sqlite3_bind_int64(stmt, 4, r->reclaimed);
+	sqlite3_bind_int64(stmt, 5, r->groups);
+	sqlite3_bind_int64(stmt, 6, r->kernel_bytes);
+	sqlite3_bind_int64(stmt, 7, r->deduped);
+
+	if (sqlite3_step(stmt) != SQLITE_DONE)
+		ret = -1;
+out:
+	if (ret)
+		perror_sqlite(ret, "recording run history");
+	return ret;
 }
 
 static int __dbfile_count_rows(sqlite3_stmt *s, uint64_t *num)
