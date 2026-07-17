@@ -169,10 +169,12 @@ Will print additional information about each file when run with
 \f[CR]\-v\f[R].
 .TP
 \f[B]\-\-stats\f[R]
-Print a summary of the hashfile and exit: its format and identity, how
-many files and hashes it holds, the total logical data tracked, and how
-much whole\-file duplication it records (duplicate groups and
-reclaimable bytes).
+Print a summary of the hashfile and exit: its format and identity, the
+stored scan configuration if any (the options, paths and excludes a bare
+\f[CR]oans \-\-hashfile=FILE\f[R] would replay), how many files and
+hashes it holds, the total logical data tracked, and how much
+whole\-file duplication it records (duplicate groups and reclaimable
+bytes).
 Requires the \f[CR]\-\-hashfile\f[R] option.
 (Replaces the standalone \f[CR]hashstats\f[R] tool.)
 .TP

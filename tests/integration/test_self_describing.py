@@ -91,6 +91,21 @@ class SelfDescribingConfigTest(DuperemoveTest):
         self.assertEqual(roots, sorted([os.path.realpath(self.path("one")),
                                         os.path.realpath(self.path("two"))]))
 
+    def test_stats_shows_stored_config(self):
+        os.makedirs(self.path("tree/skip"))
+        self.write("tree/a", b"a" * 8192)
+        self.dm("-rd", "--min-filesize=4096",
+                "--exclude", self.path("tree/skip"), self.path("tree"))
+
+        self.dm("--stats")
+        self.assertDmOk()
+        self.assertIn("stored scan", self.out)
+        self.assertIn("-r", self.out)
+        self.assertIn("-d", self.out)
+        self.assertIn("--min-filesize=4096", self.out)
+        self.assertIn(os.path.realpath(self.path("tree")), self.out)
+        self.assertIn(os.path.realpath(self.path("tree/skip")), self.out)
+
     def test_excludes_round_trip(self):
         os.makedirs(self.path("tree/keep"))
         os.makedirs(self.path("tree/skip"))

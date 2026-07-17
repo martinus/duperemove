@@ -149,6 +149,56 @@ static int print_hashfile_stats(char *filename)
 		       col_dim, 100.0 * freelist / page_count, col_reset);
 	fflush(stdout);
 
+	/* --- stored scan config (self-describing hashfile), if any --- */
+	{
+		struct scan_config sc;
+
+		if (dbfile_load_scan_config(db, &sc) > 0) {
+			char opts[256] = "";
+			char dopt[64] = "";
+			size_t o = 0;
+
+			if (sc.recurse)
+				o += snprintf(opts + o, sizeof(opts) - o, "-r ");
+			if (sc.run_dedupe)
+				o += snprintf(opts + o, sizeof(opts) - o, "-d ");
+			if (sc.skip_zeroes)
+				o += snprintf(opts + o, sizeof(opts) - o, "--skip-zeroes ");
+			if (sc.min_filesize > 1)
+				o += snprintf(opts + o, sizeof(opts) - o,
+					      "--min-filesize=%"PRIu64" ", sc.min_filesize);
+			/* --dedupe-options: only the non-default tokens. */
+			if (sc.only_whole_files)
+				strcat(dopt, "only_whole_files,");
+			if (sc.do_block_hash)
+				strcat(dopt, "partial,");
+			if (!sc.dedupe_same_file)
+				strcat(dopt, "nosame,");
+			if (dopt[0]) {
+				dopt[strlen(dopt) - 1] = '\0';	/* drop trailing comma */
+				o += snprintf(opts + o, sizeof(opts) - o,
+					      "--dedupe-options=%s ", dopt);
+			}
+			if (o > 0 && opts[o - 1] == ' ')
+				opts[o - 1] = '\0';		/* drop trailing space */
+
+			printf("\n%s%sstored scan%s   %s(replayed by: oans --hashfile=%s)%s\n",
+			       col_bold, col_blue, col_reset, col_dim, filename, col_reset);
+			printf("  %soptions%s         %s\n", col_dim, col_reset,
+			       opts[0] ? opts : "(defaults)");
+			for (i = 0; i < sc.nroots; i++)
+				printf("  %s%s%s %s\n", col_dim,
+				       i == 0 ? "paths      " : "           ",
+				       col_reset, sc.roots[i]);
+			for (i = 0; i < sc.nexcludes; i++)
+				printf("  %s%s%s %s\n", col_dim,
+				       i == 0 ? "excludes   " : "           ",
+				       col_reset, sc.excludes[i]);
+			fflush(stdout);
+			scan_config_free(&sc);
+		}
+	}
+
 	/*
 	 * files: one scan reads every size into an array, from which we get
 	 * count/hashed/logical/largest and (after a fast C sort) the median. An

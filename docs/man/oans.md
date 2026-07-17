@@ -157,10 +157,12 @@ variable is set.
 Will print additional information about each file when run with `-v`.
 
 **\--stats**
-  ~ Print a summary of the hashfile and exit: its format and identity, how many
-files and hashes it holds, the total logical data tracked, and how much
-whole-file duplication it records (duplicate groups and reclaimable bytes).
-Requires the `--hashfile` option. (Replaces the standalone `hashstats` tool.)
+  ~ Print a summary of the hashfile and exit: its format and identity, the
+stored scan configuration if any (the options, paths and excludes a bare
+`oans --hashfile=FILE` would replay), how many files and hashes it holds, the
+total logical data tracked, and how much whole-file duplication it records
+(duplicate groups and reclaimable bytes). Requires the `--hashfile` option.
+(Replaces the standalone `hashstats` tool.)
 
 **-R** `files ..`
   ~ Remove file from the db and exit. oans will read the list from
