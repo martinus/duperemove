@@ -46,10 +46,10 @@ scripts/release.sh prepare X.Y.Z          # bump both man pages, run verify.sh, 
 scripts/release.sh publish X.Y.Z [NOTES]  # tag the merged master + create the GH release
 ```
 
-- `prepare` branches `release/vX.Y.Z` off `origin/master`, bumps the version in
-  the **only two spots** — `docs/man/oans.8` (`.TH … "oans X.Y.Z" …`) and
-  `docs/man/oans.md` (`footer: oans X.Y.Z`) — runs the full `verify.sh` gate,
-  then pushes and opens the PR. It refuses on a dirty tree or an existing tag.
+- `prepare` branches `release/vX.Y.Z` off `origin/master`, bumps the committed
+  man-page version strings (the script owns the exact files and sed patterns),
+  runs the full `verify.sh` gate, then pushes and opens the PR. It refuses on a
+  dirty tree or an existing tag.
 - `publish` refuses until that bump is on `origin/master` (i.e. the PR merged),
   then makes the annotated tag and the GitHub release. With no `NOTES` file it
   seeds the body from the commit log since the previous tag (edit on GitHub

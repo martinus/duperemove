@@ -84,24 +84,20 @@ publish)
 
 	git checkout -q --detach origin/master
 
-	# Annotate the tag with the notes (or just the version line if none given).
-	if [[ -n "$notes_file" ]]; then
-		git tag -a "v$ver" -F <(printf 'oans %s\n\n' "$ver"; cat "$notes_file")
-	else
-		git tag -a "v$ver" -m "oans $ver"
-	fi
-	git push -q origin "v$ver"
-
-	# Release notes: the supplied file, else a skeleton from the commit log.
-	tmp_notes=""
+	# Resolve the notes body once (the supplied file, or a skeleton from the
+	# commit log since the previous tag); the tag annotation and the GitHub
+	# release share it. HEAD is the commit v$ver will point at, and the tag
+	# doesn't exist yet, so `git describe HEAD` finds the previous release.
 	if [[ -z "$notes_file" ]]; then
-		tmp_notes=$(mktemp)
-		trap 'rm -f "$tmp_notes"' EXIT
-		prev=$(git describe --tags --abbrev=0 "v$ver^" 2>/dev/null || true)
+		notes_file=$(mktemp)
+		trap 'rm -f "$notes_file"' EXIT
+		prev=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)
 		{ echo "## Changes"; echo
-		  git log --no-merges --pretty='- %s' "${prev:+$prev..}v$ver"; } > "$tmp_notes"
-		notes_file=$tmp_notes
+		  git log --no-merges --pretty='- %s' "${prev:+$prev..}HEAD"; } > "$notes_file"
 	fi
+
+	git tag -a "v$ver" -F <(printf 'oans %s\n\n' "$ver"; cat "$notes_file")
+	git push -q origin "v$ver"
 	gh release create "v$ver" --repo "$REPO" --title "oans v$ver" --notes-file "$notes_file"
 	echo "Published https://github.com/$REPO/releases/tag/v$ver"
 	;;
