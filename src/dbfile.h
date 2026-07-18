@@ -146,6 +146,16 @@ struct run_record {
 };
 int dbfile_record_run(struct dbhandle *db, const struct run_record *r);
 
+/* Lifetime totals over run_history, for --history and --json. */
+struct run_summary {
+	uint64_t	runs;
+	uint64_t	total_reclaimed;
+	uint64_t	total_files;
+	int64_t		first_ts;
+	int64_t		last_ts;
+};
+int dbfile_get_run_summary(struct dbhandle *db, struct run_summary *s);
+
 struct dbfile_stats {
 	uint64_t	num_b_hashes;
 	uint64_t	num_e_hashes;

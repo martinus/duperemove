@@ -1137,6 +1137,30 @@ out:
 	return ret;
 }
 
+int dbfile_get_run_summary(struct dbhandle *dbh, struct run_summary *s)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	int ret;
+
+	memset(s, 0, sizeof(*s));
+	ret = sqlite3_prepare_v2(dbh->db,
+		"select count(*), ifnull(sum(reclaimed),0), "
+		"ifnull(sum(files_scanned),0), ifnull(min(ts),0), "
+		"ifnull(max(ts),0) from run_history", -1, &stmt, NULL);
+	if (ret) {
+		perror_sqlite(ret, "reading run summary");
+		return ret;
+	}
+	if (sqlite3_step(stmt) == SQLITE_ROW) {
+		s->runs = sqlite3_column_int64(stmt, 0);
+		s->total_reclaimed = sqlite3_column_int64(stmt, 1);
+		s->total_files = sqlite3_column_int64(stmt, 2);
+		s->first_ts = sqlite3_column_int64(stmt, 3);
+		s->last_ts = sqlite3_column_int64(stmt, 4);
+	}
+	return 0;
+}
+
 static int __dbfile_count_rows(sqlite3_stmt *s, uint64_t *num)
 {
 	int ret;
