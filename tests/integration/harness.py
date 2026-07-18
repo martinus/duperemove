@@ -43,6 +43,10 @@ _ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 _NET_CHANGE_RE = re.compile(r"net change in shared extents of:\s*(\d+)")
+# The human summary line, e.g. "  Reclaimed      1.0 MiB across 1 group".
+# The size is human_size()-rendered ("1.0 MiB", "512 B"), so assert on the
+# rendered string; for exact bytes use --json's reclaimed_total_bytes instead.
+_RECLAIMED_RE = re.compile(r"Reclaimed\s+([\d.]+ [A-Za-z]+)\s+across\s+(\d+)\s+group")
 
 
 # --------------------------------------------------------------------------
@@ -187,13 +191,17 @@ class DuperemoveTest(unittest.TestCase):
 
     # -- running oans ------------------------------------------------
 
-    def dm(self, *args, hashfile=True, stdin=None, env=None):
+    def dm(self, *args, hashfile=True, stdin=None, env=None, quiet=True):
         """Run oans; capture combined output in self.out and code in self.rc.
 
         Pass stdin=<str> to feed the process on standard input (e.g. a "-"
         file list), or env={...} to add environment variables for this run.
+        Runs with -q by default (terse output); pass quiet=False to get the
+        full human summary block (e.g. to assert on the 'Reclaimed' line).
         """
-        cmd = [DUPEREMOVE, "-q", "--io-threads=4"]
+        cmd = [DUPEREMOVE, "--io-threads=4"]
+        if quiet:
+            cmd.insert(1, "-q")
         if hashfile:
             cmd += ["--hashfile", self.hf]
         cmd += list(args)
@@ -231,6 +239,21 @@ class DuperemoveTest(unittest.TestCase):
         """The last dedupe added no sharing (explicit 0, or no line at all)."""
         nc = self.net_change()
         self.assertIn(nc, (None, 0), f"expected no new sharing, got {nc}")
+
+    def reclaimed_summary(self):
+        """`(size_str, groups)` from the human 'Reclaimed' summary line, or None.
+
+        size_str is the rendered human figure (e.g. '1.0 MiB') — the honest
+        disk-freed amount, one physical copy kept per group. oans omits the
+        whole summary block under -q or when there was nothing to dedupe. For
+        exact byte assertions use the --json `reclaimed_total_bytes` field.
+        """
+        m = _RECLAIMED_RE.search(self.out)
+        return (m.group(1), int(m.group(2))) if m else None
+
+    def assertReclaimed(self, size_str, groups, msg=None):
+        """Assert the summary reported `size_str` reclaimed across `groups`."""
+        self.assertEqual((size_str, groups), self.reclaimed_summary(), msg)
 
     # -- hashfile (SQLite) inspection --------------------------------------
 

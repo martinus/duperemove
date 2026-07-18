@@ -36,20 +36,27 @@ compat symlink. Some identifiers keep the old name on purpose: the
 ## Releasing
 
 The version string comes from `git describe --tags` (Makefile), so **a release
-is just a git tag** — there is no committed `VERSION` file to bump. Convention
-(latest: `v1.2.0`, 2026-07-18):
+is just a git tag** — there is no committed `VERSION` file to bump. Use
+**`scripts/release.sh`**, which encodes the whole convention (latest: `v1.2.0`,
+2026-07-18). It's two phases because merging the bump PR is a human decision:
 
-1. Branch `release/vX.Y.Z` off `origin/master`. Bump the version in **both** man
-   pages — `docs/man/oans.8` (`.TH "oans" "8" "<Month Year>" "oans X.Y.Z" …`) and
-   `docs/man/oans.md` (`footer: oans X.Y.Z`). These are the only two spots.
-2. Run `scripts/verify.sh`, then open a PR titled `Bump version to X.Y.Z` and
-   merge it (with the user's OK, as always).
-3. Annotated tag on the merged master HEAD, then push it:
-   `git tag -a vX.Y.Z -m "oans X.Y.Z\n\n<one-paragraph summary>"` and
-   `git push origin vX.Y.Z`.
-4. `gh release create vX.Y.Z --repo martinus/oans --title "oans vX.Y.Z" --notes …`
-   with notes grouped by theme (Features / Performance / Correctness / Housekeeping).
-   Releases attach **no** build artifacts — source only.
+```sh
+scripts/release.sh prepare X.Y.Z          # bump both man pages, run verify.sh, open the PR
+#   → review & merge the "Bump version to X.Y.Z" PR (with the user's OK, as always)
+scripts/release.sh publish X.Y.Z [NOTES]  # tag the merged master + create the GH release
+```
+
+- `prepare` branches `release/vX.Y.Z` off `origin/master`, bumps the committed
+  man-page version strings (the script owns the exact files and sed patterns),
+  runs the full `verify.sh` gate, then pushes and opens the PR. It refuses on a
+  dirty tree or an existing tag.
+- `publish` refuses until that bump is on `origin/master` (i.e. the PR merged),
+  then makes the annotated tag and the GitHub release. With no `NOTES` file it
+  seeds the body from the commit log since the previous tag (edit on GitHub
+  after); pass a file for grouped notes (Features / Performance / Correctness /
+  Housekeeping). Releases attach **no** build artifacts — source only.
+- It honors `PKG_CONFIG_PATH` / `DUPEREMOVE_TEST_DIR` like `verify.sh`, so on
+  this box run it with `PKG_CONFIG_PATH=/tmp/devroot/pc scripts/release.sh …`.
 
 - **Versioning is incremental semver.** The CLI is a superset of duperemove's and
   hashfiles auto-rebuild, so feature batches are backward-compatible → **minor**
