@@ -95,6 +95,12 @@ oans --stats --hashfile=/var/cache/oans/media.hash
 sudo systemctl enable --now oans@media.timer
 ```
 
+The name after `@` is the **basename of your hashfile** in `/var/cache/oans/`:
+`oans@media` runs `--hashfile=/var/cache/oans/media.hash`. So match it to the
+hashfile you created in Steps 2–3 — if yours is
+`/var/cache/oans/data.hash`, enable `oans@data.timer` instead. (The unit skips
+cleanly until that hashfile exists, so set it up first.)
+
 Done. Weekly from here, oans re-scans `/srv/media`, hashes only what changed,
 and deduplicates — with no arguments, because the hashfile remembers everything.
 To change the frequency, override `OnCalendar=`:
