@@ -194,6 +194,7 @@ Licensed under the **GNU General Public License, version 2** — see
 
 ## Links
 
+- [NAS quick start](docs/nas-quickstart.md) — set up scheduled dedupe on a NAS/server
 - [oans man page](docs/man/oans.md) — full reference
 - [Upstream duperemove](https://github.com/markfasheh/duperemove) — the original project
 - [Upstream wiki](https://github.com/markfasheh/duperemove/wiki) — design & performance notes

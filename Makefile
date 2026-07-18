@@ -114,7 +114,7 @@ doc:
 DIST         = oans-$(VERSION)
 DIST_TARBALL = $(VERSION).tar.gz
 DIST_SOURCES = $(CFILES) $(sort $(wildcard src/*.h)) LICENSE Makefile \
-	README.md docs/man/oans.md $(MANPAGE) $(COMPLETION) \
+	README.md docs/man/oans.md docs/nas-quickstart.md $(MANPAGE) $(COMPLETION) \
 	systemd/oans@.service systemd/oans@.timer systemd/README.md
 
 # Source tarball with the resolved version embedded, so tarball builds (no
