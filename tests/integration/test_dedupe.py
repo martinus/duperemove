@@ -30,6 +30,16 @@ class DedupeTest(DuperemoveTest):
         # Both copies become shared: net change counts the shared bytes on each.
         self.assertEqual(2 * MiB, self.net_change(), "net shared change for a 1 MiB pair")
 
+    def test_reports_honest_reclaimed(self):
+        # The human summary reports the disk actually freed: deduping a 1 MiB
+        # pair keeps one copy and frees the other, so 1.0 MiB across 1 group —
+        # not the 2 MiB fiemap "net change in shared extents".
+        self.mkdup("tree/a", "tree/b", MiB)
+        self.sync()
+        self.dm("-rd", self.path("tree"), quiet=False)  # -q hides the summary
+        self.assertDmOk()
+        self.assertReclaimed("1.0 MiB", 1)
+
     def test_is_idempotent(self):
         a, b = self.mkdup("tree/a", "tree/b", MiB)
         self.sync()
