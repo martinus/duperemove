@@ -9,11 +9,10 @@ C sources are under `src/` (main `src/oans.c`); man-page sources under
 symlink. Some identifiers keep the old name on purpose: the `DUPEREMOVE*` env
 vars and the `DuperemoveTest` python base class.
 
-**Local dev box:** `source scripts/devenv.sh` once per shell — it points
-pkg-config at the local header shim, sets the reflink test dir, and adds pandoc
-to `PATH` (each a no-op if absent), so `make`, `scripts/verify.sh`, etc. need no
-env prefixes. This box can't `dnf install` the `-devel` packages, hence the shim
-under `/tmp/devroot`; a normal machine with the README's deps needs none of it.
+**Local dev box:** `source scripts/devenv.sh` once per shell (see its header) so
+`make`, `scripts/verify.sh`, etc. need no env prefixes. This box can't `dnf
+install` the `-devel` packages, hence the `/tmp/devroot` pkg-config shim; a
+normal machine with the README's deps needs none of it.
 
 ## Repo layout & workflow (read first)
 
