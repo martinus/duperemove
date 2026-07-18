@@ -9,6 +9,30 @@ under `docs/man/`. The binary is `oans`; `make install` adds a `duperemove`
 compat symlink. Some identifiers keep the old name on purpose: the
 `DUPEREMOVE*` env vars and the `DuperemoveTest` python test base class.
 
+## Repo layout & workflow (read first)
+
+- **This checkout is a git *worktree*.** The default branch `master` is checked
+  out in a *sibling* worktree (`../duperemove-master`), so `git checkout master`
+  here fails ("already used by worktree"). To sync/branch from latest master:
+  `git fetch origin && git checkout --detach origin/master`, then
+  `git checkout -b <branch> origin/master`. After a branch is merged+deleted,
+  park this worktree with `git checkout --detach origin/master`.
+- **GitHub is a fork.** All `gh` commands need `--repo martinus/oans`
+  (`gh pr create --repo martinus/oans …`); a bare `gh pr create` fails.
+- **Never merge a PR without the user explicitly saying so** ("merge it"). The
+  established rhythm is: build on a branch → open a PR → wait. The user often
+  asks for a `/simplify` pass on the branch before merging.
+- **`scripts/verify.sh`** is the one-shot pre-PR gate: build (warnings = failure),
+  `make check`, and a valgrind scan+dedupe+replay smoke. Run it as
+  `PKG_CONFIG_PATH=/tmp/devroot/pc DUPEREMOVE_TEST_DIR=/home/martinus/.itest-scratch bash scripts/verify.sh`.
+- **`make doc`** (regenerate the man page from `docs/man/oans.md`) needs
+  `pandoc`, which isn't always installed; a static build was fetched to
+  `/tmp/pandoc-3.6.4/bin` (ephemeral — re-fetch if `/tmp` was cleared) and run as
+  `PATH=/tmp/pandoc-3.6.4/bin:$PATH make doc`. roff escapes `-` as `\-`, so grep
+  the generated `.8` accordingly.
+- Confirm you are testing *this* build (`./oans`), not a system-installed
+  `duperemove`, before diagnosing any runtime behaviour.
+
 ## Build & test
 
 ```sh
@@ -20,7 +44,15 @@ DUPEREMOVE=./oans python3 tests/run.py           # integration suite only
 Integration tests are Python stdlib `unittest` (no extra deps); they drive the
 built binary against a scratch tree and assert on the hashfile and on-disk
 sharing. Dedupe cases need a reflink-capable fs — override with
-`DUPEREMOVE_TEST_DIR=/mnt/btrfs`. Keep tests in `tests/`; don't add shell tests.
+`DUPEREMOVE_TEST_DIR=/mnt/btrfs` (this box: `/home/martinus/.itest-scratch`, on
+btrfs). Keep tests in `tests/`; don't add shell tests.
+
+- **Don't run scans/benchmarks out of `/tmp` — it's tmpfs**, which is not
+  reflink-capable and which `is_fs_supported()` rejects, so a scan there stores
+  **0 files silently** and dedupe is a no-op. Always point test data and
+  `DUPEREMOVE_TEST_DIR` at real btrfs/xfs, and verify a non-zero file count
+  before trusting any before/after comparison. (The `~/git` tree, ~174k files on
+  btrfs, is the usual real-data benchmark target.)
 
 ### Building on Fedora
 
@@ -134,6 +166,70 @@ site.
   throughput numbers are pure process-startup noise. The *mechanism* still
   runs; real numbers need a btrfs/xfs target.
 
+## Self-describing hashfile, history & scheduling (fork features)
+
+These are the fork's user-facing additions on top of upstream; a fresh session
+should know they exist before touching option parsing or `dbfile`.
+
+- **Self-describing hashfile.** Every run stores its scan-shaping options
+  (`-d`, `-r`, `--skip-zeroes`, `--min-filesize`, `--dedupe-options`), its roots
+  (canonicalised via `realpath`), and its `--exclude` patterns — options as
+  `opt_*` keys in `config`, roots/excludes in the `scan_roots`/`scan_excludes`
+  tables (`dbfile_store_scan_config`/`dbfile_load_scan_config`). A bare
+  `oans --hashfile=FILE` (no file args) **replays** the last run
+  (`apply_scan_config` + `drop_missing_roots` in `oans.c`). Semantics:
+  last-run-wins; other options on a bare-replay line are ignored; if a stored
+  root is missing it's skipped with a warning, and if *all* are gone oans
+  refuses (so the stat-based prune can't wipe the hashfile — e.g. an unmounted
+  drive); a replay does not re-persist (a transiently-missing root is retried
+  next time). Pinned by `test_self_describing.py`.
+- **Run history & metrics.** Each run appends a row to `run_history`
+  (`dbfile_record_run`, called from `main()` after `process_duplicates`).
+  `--history` prints a human timeline + lifetime totals; `--json` prints a flat
+  metrics object (current stats + history totals) for jq/Telegraf/node_exporter.
+  Totals go through `dbfile_get_run_summary`. Gotcha: capture the per-run
+  file count via `pscan_files_scanned()` **inside `scan_files`** (an out-param) —
+  the dedupe phase reuses the progress counters, and `pscan.files_examined` is
+  cleared ~10×/s by the renderer so it is *not* a usable total. Pinned by
+  `test_history_metrics.py`.
+- **`--stats`** prints the hashfile report (identity, stored scan config, file
+  and duplicate counts). `-L` lists files; `-R` removes paths. `-L`/`-R`/
+  `--stats`/`--history`/`--json`/`--autotune` are mutually-exclusive report
+  modes (collapsed into one `report_count` check in `parse_options`).
+- **Scheduling.** `systemd/oans@.service` + `oans@.timer` (installed by
+  `make install-systemd`, kept out of `make install`) run
+  `oans --hashfile=/var/cache/oans/%i.hash` on a timer, replaying the stored
+  config. User guide: `docs/nas-quickstart.md`.
+- The `fdupes` mode was **removed** (redundant with the core scan+dedupe); don't
+  reintroduce it.
+
+## Measured dead-ends — don't re-attempt without new evidence
+
+Each of these was investigated/measured and rejected; re-deriving them wastes a
+session (see the profiling rules above — measure, don't guess):
+
+- **Warm rescan is single-consumer pipeline-latency-bound**, not
+  CPU/query-bound. A no-op rescan of ~174k files is ~2s wall / ~0.9s CPU,
+  invariant to `--io-threads` (1..16) and CPU count — the serial consumer
+  (`__scan_file`: queue handoff + per-file `dbfile_describe_file`) sets the
+  floor. `dbfile_describe_file` is only ~0.12s of CPU.
+- **Bulk in-memory change-detection cache** (preload the `files` table into a
+  hash to skip the per-file `describe_file` query) was prototyped and
+  **measured a regression** (2.0s→3.1s): the query isn't the bottleneck, and the
+  upfront load adds ~1s. Rejected.
+- **statx-relative-to-dir-fd** (avoid re-resolving the absolute path per file)
+  gave ~5-8% less scan *CPU* but **zero wall-clock** change (walk isn't the
+  wall bottleneck); PR was closed as not worth it.
+- **A savings "preview"/dry-run is not worth building.** You can't predict real
+  reclaimed disk without doing the dedupe (compression, extent alignment, the
+  kernel declining a dedupe, and especially snapshot/external refcounts), and
+  dedupe is already safe + self-reporting, so "just run it" wins. `--stats`
+  already reports the logical upper bound.
+- **"Biggest-savings-first" dedupe order already exists**: `push_extents`
+  (`run_dedupe.c`) qsorts groups by `cmp_dext_work` = `de_len*(de_num_dupes-1)`
+  (reclaimable bytes, descending) before dispatching to the pool. Only caveat is
+  it's per generation-pass, not global — not worth changing.
+
 ## dedupe_seq (incremental dedup)
 
 Scan assigns `seq = config+1`, bumped every `--batchsize`/`-B` files (default
@@ -179,8 +275,18 @@ OANS_APP_ID` ("oans" in ASCII) and `dbfile_check()` **strictly** refuses any fil
 that doesn't carry the brand — foreign, or a pre-brand/duperemove file. A
 brand-new empty file (`dbfile_config_empty()`) is stamped *before* the check, so
 a fresh scan doesn't recreate-loop; existing files must already carry the brand.
-A failed check unlinks and recreates the hashfile (it's only a cache). Bump
-`DB_FILE_MINOR` on any schema change.
+A failed check unlinks and recreates the hashfile (it's only a cache).
+
+**On schema changes and `DB_FILE_MINOR`:** `dbfile_check()` rejects a file whose
+`minor` differs, which *discards and rebuilds* it — so a bump forces every
+existing hashfile to be re-scanned from scratch. Therefore bump `DB_FILE_MINOR`
+**only** for a change an old binary could misread; do **not** bump for a purely
+*additive* change (a new `CREATE TABLE IF NOT EXISTS`, or a new optional key in
+the `config` table). `create_tables()` runs on every open, so additive tables
+appear on old files automatically and old binaries just ignore the extra
+rows/keys. The self-describing (`scan_roots`/`scan_excludes`), run-history
+(`run_history`), and autotune (`autotune_io_threads` config key) features were
+all added this way and left `DB_FILE_MINOR` at `5.0` on purpose.
 
 A from-scratch build (new hashfile or a recreated one) sets `hashfile_rebuilt`,
 which makes `dbfile_maybe_vacuum()` force a one-off `VACUUM` at the end: a fresh
@@ -194,3 +300,9 @@ still only VACUUM once ≥25% of the file is free.
   on process kill. Only power loss risks the hashfile (due to `synchronous=OFF`).
 - A no-op rescan must net **0** changes and leave row counts identical. Use this
   as a smoke test after any scan-path change.
+- **The "Deduplicated" figure is logical, not disk.** On a compressed btrfs
+  (e.g. `zstd`), dedupe frees *compressed* blocks but the reported number is the
+  *logical* (uncompressed) amount, so real disk reclaimed is ~ratio smaller. To
+  verify actual space freed, compare `compsize` **Disk Usage** before/after (not
+  `df`); `Referenced` staying constant proves nothing was lost. `--json`'s
+  `reclaimable_logical_bytes` is likewise a logical upper bound.
