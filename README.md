@@ -40,6 +40,12 @@ Summary
 
 ## Quick start
 
+> **Prefer a prebuilt binary?** Grab the latest
+> `oans-*-linux-x86_64.tar.gz` from the
+> [releases page](https://github.com/martinus/oans/releases) — no build step;
+> the tarball's `INSTALL.txt` lists the handful of runtime libraries. Otherwise,
+> build from source:
+
 <details>
 <summary><b>Install build dependencies</b> (Fedora, Debian/Ubuntu)</summary>
 

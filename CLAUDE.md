@@ -45,7 +45,11 @@ scripts/release.sh publish X.Y.Z [NOTES]  # tag the merged master + create the G
 
 `prepare` refuses on a dirty tree or existing tag; `publish` refuses until the
 bump is on `origin/master`, then tags and releases (auto-seeds notes from the
-commit log if no `NOTES` file). Releases attach no build artifacts.
+commit log if no `NOTES` file). Publishing the release fires
+`.github/workflows/release.yml`, which builds a prebuilt x86_64 tarball
+(`oans-X.Y.Z-linux-x86_64.tar.gz` + `.sha256`, built on Ubuntu 22.04 for a low
+glibc floor) and attaches it; `workflow_dispatch` with a `tag` input backfills
+assets for an existing release.
 
 - **Incremental semver.** The CLI is a superset of duperemove's and hashfiles
   auto-rebuild, so feature batches are backward-compatible → **minor** bumps

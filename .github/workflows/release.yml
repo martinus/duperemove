@@ -1,0 +1,104 @@
+name: Release binaries
+
+# Build a prebuilt x86_64 binary and attach it to the GitHub release.
+#
+# Fires when a release is published — which is exactly what
+# `scripts/release.sh publish` does — so a normal release automatically grows a
+# downloadable tarball. `workflow_dispatch` lets you (re)build assets for an
+# existing tag by hand, e.g. to backfill a release made before this workflow.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and attach assets to (e.g. v1.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Build on the oldest supported Ubuntu for a low glibc floor, so the binary
+    # also runs on older distributions.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0   # full history + tags so `git describe --tags` yields the clean version
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
+            uuid-dev libbsd-dev libxxhash-dev
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Smoke-test the binary
+        run: ./oans --version
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          tag='${{ steps.tag.outputs.tag }}'
+          ver="${tag#v}"
+          dist="oans-${ver}-linux-x86_64"
+
+          strip oans
+          install -d "$dist"
+          install -m 0755 oans          "$dist/oans"
+          install -m 0644 docs/man/oans.8 "$dist/oans.8"
+          install -m 0644 completion/zsh/_oans "$dist/_oans"
+          install -m 0644 README.md LICENSE "$dist/"
+
+          cat > "$dist/INSTALL.txt" <<EOF
+          oans ${ver} — prebuilt x86_64 Linux binary
+          ==========================================
+
+          This is a dynamically linked binary built on Ubuntu 22.04 (glibc 2.35).
+          It needs a few shared libraries that ship with essentially every Linux
+          distribution — install them if they are missing:
+
+            Debian / Ubuntu : libglib2.0-0 libsqlite3-0 libblkid1 libmount1 libuuid1
+            Fedora / RHEL   : glib2 sqlite-libs libblkid libmount libuuid
+
+          Install:
+
+            sudo install -m 0755 oans /usr/local/bin/oans
+            sudo ln -sf oans /usr/local/bin/duperemove          # optional compat symlink
+            sudo install -Dm0644 oans.8 /usr/local/share/man/man8/oans.8
+            sudo install -Dm0644 _oans  /usr/local/share/zsh/site-functions/_oans
+
+          Then: oans --help   (and see the bundled README.md, or 'man 8 oans').
+
+          Deduplication runs through the kernel's byte-verifying FIDEDUPERANGE
+          ioctl on btrfs/xfs, so it can never corrupt your data.
+          EOF
+
+          # Record the exact shared-library requirements for transparency.
+          { echo; echo "Shared libraries this build links against:"; ldd oans; } >> "$dist/INSTALL.txt"
+
+          tar czf "${dist}.tar.gz" "$dist"
+          sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256"
+          echo "artifact=${dist}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload '${{ steps.tag.outputs.tag }}' \
+            "${{ steps.pkg.outputs.artifact }}" \
+            "${{ steps.pkg.outputs.artifact }}.sha256" \
+            --clobber --repo "$GITHUB_REPOSITORY"
