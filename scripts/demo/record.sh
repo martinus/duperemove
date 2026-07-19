@@ -21,6 +21,7 @@ repo="$(cd "$here/../.." && pwd)"
 WORK="${DEMO_DIR:-$PWD}"
 OUT="${OUT:-$WORK/demo.gif}"
 FONT="${FONT:-Hack}"
+LOSSY="${DEMO_LOSSY:-60}"   # gifsicle --lossy level; higher = smaller GIF, more speckle
 
 # Build oans if needed and expose it on PATH for the recording — without copying
 # the binary into the work dir, so we never risk deleting your real ./oans.
@@ -52,7 +53,7 @@ fi
 
 # Optimize the GIF: a quality-neutral ~30% shrink for flat terminal colours.
 if command -v gifsicle >/dev/null; then
-  gifsicle -O3 --lossy=30 "$OUT" -o "$OUT.tmp" 2>/dev/null && mv -f "$OUT.tmp" "$OUT" || rm -f "$OUT.tmp"
+  gifsicle -O3 --lossy="$LOSSY" "$OUT" -o "$OUT.tmp" 2>/dev/null && mv -f "$OUT.tmp" "$OUT" || rm -f "$OUT.tmp"
 else
   echo "note: install gifsicle to shrink the GIF (~30% smaller)." >&2
 fi

@@ -17,7 +17,7 @@ Set Theme "Dracula"
 Set WindowBar Colorful
 Set BorderRadius 10
 Set TypingSpeed 55ms
-Set Framerate 24
+Set Framerate 12   # terminal casts read fine at 12fps and it roughly halves the GIF
 
 # Put oans on PATH (exposed by record.sh) without filming the plumbing.
 Hide
