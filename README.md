@@ -13,8 +13,12 @@
        alt="oans scanning a large tree, deduplicating it, and reporting the space reclaimed">
 </p>
 
-oans finds files and extents with identical content and asks the kernel to
-share their storage. It is a performance-focused fork of
+<img src="assets/logo.png" align="left" width="180"
+     alt="The oans logo, designed and drawn by my 8-year-old daughter">
+
+oans (Austrian dialect for "one", logo by my daughter) finds files and extents
+with identical content and asks the kernel to share their storage. It is a
+performance-focused fork of
 [duperemove](https://github.com/markfasheh/duperemove) by Mark Fasheh — same
 proven engine, rebuilt for the workflow that actually matters: **re-running
 regularly on a big, mostly-stable tree** (a NAS, a backup target, a build
@@ -163,6 +167,9 @@ on real btrfs data before landing. By design the tool cannot put your data at
 risk regardless: dedupe is performed by the kernel's `FIDEDUPERANGE` ioctl,
 which byte-compares every range before sharing it (see the note near the top),
 so the worst a bug can do is waste work or miss a dedupe.
+
+The logo — a bauble full of rainbow *ones* — was designed and hand-drawn by my
+8-year-old daughter.
 
 Differences to know about:
 
