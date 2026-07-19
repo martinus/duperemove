@@ -63,7 +63,7 @@ Summary
 
 ```sh
 # Fedora / RHEL
-sudo dnf install gcc make pkgconf-pkg-config \
+sudo dnf install gcc make libatomic pkgconf-pkg-config \
     glib2-devel sqlite-devel xxhash-devel \
     libuuid-devel libmount-devel libblkid-devel libbsd-devel
 
