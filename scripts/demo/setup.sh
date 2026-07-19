@@ -7,6 +7,11 @@
 # do but stays short. Unique file sizes follow an exponential distribution (many
 # small, a few large), seeded so the mix is reproducible.
 #
+# Generation is parallel and spawn-free: one awk pass plans every path+size, then
+# a pool of python workers each stream /dev/urandom for many files at once (no
+# per-file `head`), and copies are made with a parallel `cp`. Finally the page
+# cache is dropped so the recorded scan reads cold from disk.
+#
 #   usage: setup.sh <work-dir on btrfs or xfs>
 set -euo pipefail
 
@@ -27,52 +32,84 @@ case "$fstype" in
      exit 1 ;;
 esac
 
-rm -rf "$DEST/tree"; rm -f "$DEST"/demo.hash*
-mkdir -p "$DEST/tree"
+rm -rf "$DEST/tree"; rm -f "$DEST"/demo.hash* "$DEST"/.jobs_* "$DEST"/.chunk_* "$DEST"/.reclaim
+mkdir -p "$DEST/tree/data" "$DEST/tree/dup"
+nworkers=$(nproc 2>/dev/null || echo 4)
 
-# Draw one size (KiB) per distinct content from an exponential distribution:
-# s = -mean*ln(U), clamped to [MIN,MAX] and rounded to 4 KiB. Deterministic.
-total_contents=$(( UNIQUE + DUP_GROUPS ))
-mapfile -t sizes < <(awk -v n="$total_contents" -v mean="$MEAN_KB" -v min="$MIN_KB" \
-                         -v max="$MAX_KB" -v seed="$SEED" 'BEGIN{
+# 1) Plan everything in one awk pass. Sizes are exponential (s = -mean*ln(U)),
+#    clamped and rounded to 4 KiB. Emit a "generate" list (bytes<TAB>path, one
+#    per unique file and per group original) and a "copy" list (src<TAB>dst).
+awk -v uniq="$UNIQUE" -v groups="$DUP_GROUPS" -v copies="$COPIES" \
+    -v mean="$MEAN_KB" -v min="$MIN_KB" -v max="$MAX_KB" -v seed="$SEED" -v dest="$DEST" '
+  function esize(   u, s) {
+    u = rand(); if (u < 1e-9) u = 1e-9; s = -mean * log(u);
+    if (s < min) s = min; if (s > max) s = max;
+    s = int(s / 4) * 4; if (s < 4) s = 4; return s;
+  }
+  BEGIN {
     srand(seed);
-    for (i = 0; i < n; i++) {
-      u = rand(); if (u < 1e-9) u = 1e-9;
-      s = -mean * log(u);
-      if (s < min) s = min; if (s > max) s = max;
-      s = int(s / 4) * 4;   if (s < 4) s = 4;
-      print s;
+    gen = dest "/.jobs_gen"; cpy = dest "/.jobs_copy";
+    for (i = 1; i <= uniq; i++) {
+      s = esize();
+      printf "%d\t%s/tree/data/set_%03d/u_%04d.bin\n", s*1024, dest, int((i-1)/300), i > gen;
     }
-  }')
+    for (g = 1; g <= groups; g++) {
+      s = esize();
+      orig = sprintf("%s/tree/dup/group_%03d/original.bin", dest, g);
+      printf "%d\t%s\n", s*1024, orig > gen;
+      for (c = 1; c < copies; c++)
+        printf "%s\t%s/tree/dup/group_%03d/copy_%02d.bin\n", orig, dest, g, c > cpy;
+      reclaim += s * (copies - 1);
+    }
+    printf "%d\n", reclaim > (dest "/.reclaim");
+  }'
 
-# Write a file of N KiB of random data.
-mkrand() { head -c "$(( $2 * 1024 ))" /dev/urandom > "$1"; }
+# 2) Pre-create the directories the workers write into (spawn-free via xargs).
+awk -v n="$(( (UNIQUE + 299) / 300 ))" -v dest="$DEST" \
+  'BEGIN { for (i = 0; i < n; i++) printf "%s/tree/data/set_%03d\0", dest, i }' | xargs -0 mkdir -p
+awk -v n="$DUP_GROUPS" -v dest="$DEST" \
+  'BEGIN { for (g = 1; g <= n; g++) printf "%s/tree/dup/group_%03d\0", dest, g }' | xargs -0 mkdir -p
 
-echo "Generating $UNIQUE unique files + $DUP_GROUPS groups ×${COPIES} (exponential sizes, mean ${MEAN_KB} KiB) ..."
+echo "Generating $UNIQUE unique files + $DUP_GROUPS groups ×${COPIES} (mean ${MEAN_KB} KiB) on ${nworkers} workers ..."
 
-# Unique, non-duplicated files, spread across subdirs (300 per dir). Sizes
-# [0 .. UNIQUE-1] are the uniques; [UNIQUE ..] are the group originals.
-for i in $(seq 1 "$UNIQUE"); do
-  d="$DEST/tree/data/set_$(printf '%03d' $(( (i - 1) / 300 )))"
-  mkdir -p "$d"
-  mkrand "$d/u_$(printf '%04d' "$i").bin" "${sizes[i - 1]}"
-done
+# 3) Generate random-content files in parallel. Split the gen list into nworkers
+#    chunks; each worker opens /dev/urandom once and streams bytes for all its
+#    files — no per-file process spawns.
+gen_py='
+import os, sys
+u = os.open("/dev/urandom", os.O_RDONLY)
+for line in open(sys.argv[1]):
+    b, p = line.rstrip("\n").split("\t", 1)
+    n = int(b)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    while n > 0:
+        d = os.read(u, min(n, 1 << 20)); os.write(fd, d); n -= len(d)
+    os.close(fd)
+'
+split -n "l/$nworkers" "$DEST/.jobs_gen" "$DEST/.chunk_gen." 2>/dev/null \
+  || cp "$DEST/.jobs_gen" "$DEST/.chunk_gen.aa"
+for ch in "$DEST"/.chunk_gen.*; do python3 -c "$gen_py" "$ch" & done
+wait
 
-# Duplicated groups: one original + COPIES-1 real copies each.
-for g in $(seq 1 "$DUP_GROUPS"); do
-  d="$DEST/tree/dup/group_$(printf '%03d' "$g")"
-  mkdir -p "$d"
-  mkrand "$d/original.bin" "${sizes[UNIQUE + g - 1]}"
-  for c in $(seq 1 "$(( COPIES - 1 ))"); do
-    cp --reflink=never "$d/original.bin" "$d/copy_$(printf '%02d' "$c").bin"
-  done
-done
+# 4) Make the duplicate copies in parallel. --reflink=never is essential: on
+#    btrfs `cp` reflink-copies by default, leaving oans nothing to reclaim.
+if [ -s "$DEST/.jobs_copy" ]; then
+  tr '\t\n' '\0\0' < "$DEST/.jobs_copy" | xargs -0 -n2 -P"$nworkers" cp --reflink=never
+fi
 
-# Reclaimable = sum over groups of (COPIES-1) x group size.
-reclaim_kb=0
-for g in $(seq 1 "$DUP_GROUPS"); do
-  reclaim_kb=$(( reclaim_kb + sizes[UNIQUE + g - 1] * (COPIES - 1) ))
-done
+reclaim_kb=$(cat "$DEST/.reclaim")
+rm -f "$DEST"/.jobs_gen "$DEST"/.jobs_copy "$DEST"/.chunk_gen.* "$DEST"/.reclaim
+
+# 5) Drop the page cache so the recorded scan reads cold from disk (realistic,
+#    and it makes the hashing phase visibly longer). Needs root; best-effort.
+if [ "${DROP_CACHES:-1}" = 1 ]; then
+  sync
+  if ! { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null; then
+    sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null \
+      || echo "note: could not drop caches (need root); scan reads warm cache. Set DROP_CACHES=0 to skip." >&2
+  fi
+fi
+
 printf 'tree: %s  (%d files = %d unique + %d groups x%d; ~%d MiB reclaimable across %d groups)\n' \
   "$(du -sh "$DEST/tree" | cut -f1)" \
   "$(( UNIQUE + DUP_GROUPS * COPIES ))" \
