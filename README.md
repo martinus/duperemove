@@ -158,7 +158,7 @@ attribution below.
 
 ## Relationship to duperemove
 
-oans (Austrian dialect for *"one"* — as in one copy) builds on
+oans builds on
 [duperemove](https://github.com/markfasheh/duperemove); all of the original
 design and code is the work of **Mark Fasheh** and the upstream contributors,
 and none of this exists without them. The fork's improvements were developed
@@ -167,9 +167,6 @@ on real btrfs data before landing. By design the tool cannot put your data at
 risk regardless: dedupe is performed by the kernel's `FIDEDUPERANGE` ioctl,
 which byte-compares every range before sharing it (see the note near the top),
 so the worst a bug can do is waste work or miss a dedupe.
-
-The logo — a bauble full of rainbow *ones* — was designed and hand-drawn by my
-8-year-old daughter.
 
 Differences to know about:
 
