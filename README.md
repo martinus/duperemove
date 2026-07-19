@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" width="200" alt="oans logo — a hand-drawn bauble with rainbow ones inside">
+</p>
+
 # oans
 
 **Fast, safe, set-and-forget deduplication for btrfs and XFS.**
