@@ -28,12 +28,13 @@ Show
 Sleep 1s
 
 # 1) First run: hash + dedupe the tree. Live progress + honest summary.
-#    Wait for the summary rather than a fixed sleep, so this stays correct even
-#    if you resize the dataset (a bigger tree just takes longer).
+#    Wait for the summary's "Elapsed" line — printed on every dedupe run whatever
+#    the headline wording — rather than a fixed sleep, so this stays correct
+#    however long a bigger tree takes to scan.
 Type "oans -dr --hashfile=demo.hash tree"
 Sleep 500ms
 Enter
-Wait+Screen@300s /Reclaimed/
+Wait+Screen@600s /Elapsed/
 Sleep 5s
 
 # 2) What the hashfile holds and how much is reclaimable.
