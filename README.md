@@ -5,6 +5,11 @@
 [![CI](https://github.com/martinus/oans/actions/workflows/ci.yml/badge.svg)](https://github.com/martinus/oans/actions/workflows/ci.yml)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL_v2-blue.svg)](LICENSE)
 
+<p align="center">
+  <img src="assets/demo.gif" width="900"
+       alt="oans scanning a large tree, deduplicating it, and reporting the space reclaimed">
+</p>
+
 oans finds files and extents with identical content and asks the kernel to
 share their storage. It is a performance-focused fork of
 [duperemove](https://github.com/markfasheh/duperemove) by Mark Fasheh — same
