@@ -1835,9 +1835,10 @@ static void mark_inode_seen(uint64_t ino, uint64_t subvol)
 	/* Grow at ~70% load to keep probes short. If growth OOMs and the table
 	 * would otherwise fill completely, skip the insert (worst case is the
 	 * pre-fix behavior) rather than risk a full-table probe loop. */
-	if ((seen_count + 1) * 10 >= seen_cap * 7 && !seen_grow() &&
-	    seen_count + 1 >= seen_cap)
-		return;
+	if ((seen_count + 1) * 10 >= seen_cap * 7) {
+		if (!seen_grow() && seen_count + 1 >= seen_cap)
+			return;
+	}
 	seen_insert(ino, subvol);
 }
 
