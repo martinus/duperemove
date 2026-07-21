@@ -26,6 +26,13 @@ struct pscan_thread {
 	uint64_t			file_total_bytes;
 	char				file_path[PATH_MAX + 1];
 
+	/*
+	 * Whether finishing this slot completes a whole file (bumps the scanned
+	 * file count). A chunk of a file (#88) sets this false on all but the
+	 * last chunk, so a K-chunk file still counts once.
+	 */
+	bool				count_as_file;
+
 	enum pscan_thread_status	status;
 };
 

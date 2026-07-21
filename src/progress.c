@@ -452,7 +452,8 @@ void pscan_reset_thread(struct pscan_thread **progress)
 	if (scanned > total)
 		(*progress)->total_scanned_bytes -= scanned - total;
 
-	(*progress)->total_scanned_files++;
+	if ((*progress)->count_as_file)
+		(*progress)->total_scanned_files++;
 	(*progress)->file_path[0] = '\0';
 }
 
@@ -509,6 +510,8 @@ struct pscan_thread *pscan_claim_slot(pid_t tid,
 		slot = pscan_register_thread(tid);
 		slot->status = status;
 	}
+	/* Default: finishing this slot completes one file; a chunk clears it. */
+	slot->count_as_file = true;
 	return slot;
 }
 

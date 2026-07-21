@@ -251,9 +251,11 @@ struct scan_ctxt {
 	size_t off; /* file offset of the last processed bytes */
 	size_t read_cap; /* offset of the next all-hole block: reads stop here (see fill_buffer) */
 	struct fiemap *fiemap;
+	bool owns_fiemap; /* false for a chunk: its fiemap is shared and freed by the scan_job */
 	unsigned int extent_cursor; /* resume hint for get_extent() in process_extents */
-	struct running_checksum *file_csum;  /* folds each block's (loff, digest); see process_block */
+	struct running_checksum *file_csum;  /* stream each block's (loff, digest) here, or NULL (a chunk defers to the merge); see process_block */
 	struct running_checksum *extent_csum;
+	bool retain_blocks; /* keep block records in hashes->blocks (block-dedup storage, or a chunk's merge input) */
 };
 
 /*
@@ -291,29 +293,43 @@ static bool seed_reject(bool parent_checked)
 	return false;
 }
 
-static bool allocate_hashes(struct hashes *hashes, struct scan_ctxt *ctxt)
+/*
+ * Size the hash arrays for the [start, end) byte range (the whole file, or one
+ * chunk). Sizes from the bytes actually mapped in that range, not its length: a
+ * large sparse file (e.g. `truncate -s 1T`) maps few or no extents, so sizing by
+ * length would eagerly allocate hundreds of MB of block records we never fill.
+ * Holes are skipped in the scan loop; add_block_hash()/store_extent() grow the
+ * arrays if these estimates are ever short.
+ */
+static bool allocate_hashes(struct hashes *hashes, struct fiemap *fiemap,
+			    size_t start, size_t end)
 {
-	hashes->extents_count = ctxt->fiemap->fm_mapped_extents;
-	hashes->extents = calloc(hashes->extents_count, sizeof(struct extent_csum));
-
-	/*
-	 * Size the block array from the bytes that are actually mapped, not
-	 * from filesize: a large sparse file (e.g. `truncate -s 1T`) maps few
-	 * or no extents, so sizing by filesize would eagerly allocate hundreds
-	 * of MB of block records we will never fill. Holes are skipped in the
-	 * scan loop, so they contribute no block hashes. add_block_hash()
-	 * grows the array if this estimate is ever short.
-	 */
+	unsigned int nr_extents = 0;
 	size_t mapped = 0;
-	for (unsigned int i = 0; i < ctxt->fiemap->fm_mapped_extents; i++)
-		mapped += ctxt->fiemap->fm_extents[i].fe_length;
-	if (mapped > ctxt->filesize)
-		mapped = ctxt->filesize;
+
+	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++) {
+		struct fiemap_extent *e = &fiemap->fm_extents[i];
+		size_t es = e->fe_logical;
+		size_t ee = e->fe_logical + e->fe_length;
+
+		if (ee <= start || es >= end)
+			continue;			/* extent outside the range */
+		if (es < start)
+			es = start;
+		if (ee > end)
+			ee = end;
+		nr_extents++;
+		mapped += ee - es;
+	}
+
+	hashes->extents_count = nr_extents;
+	hashes->extents = calloc(nr_extents, sizeof(struct extent_csum));
 
 	hashes->blocks_count = mapped / blocksize + 1;
 	hashes->blocks = calloc(hashes->blocks_count, sizeof(struct block_csum));
 
-	return hashes->extents && hashes->blocks;
+	/* A range with no mapped extents (a hole) legitimately allocates none. */
+	return (nr_extents == 0 || hashes->extents) && hashes->blocks;
 }
 
 static void free_hashes(struct hashes *hashes)
@@ -349,6 +365,20 @@ err:
 	return 1;
 }
 
+/*
+ * Ready the per-thread read buffer for a fresh scan: allocate it on first use,
+ * otherwise just drop any leftovers. Returns nonzero if allocation failed.
+ */
+static int reset_buffer(struct buffer *buffer)
+{
+	if (!buffer->buf)
+		return prepare_buffer(buffer);
+
+	buffer->dl_offset = 0;
+	buffer->dl_len = 0;
+	return 0;
+}
+
 static void free_scan_ctxt(struct scan_ctxt *ctxt)
 {
 	if (!ctxt)
@@ -357,7 +387,7 @@ static void free_scan_ctxt(struct scan_ctxt *ctxt)
 	if (ctxt->fd >= 0)
 		close(ctxt->fd);
 
-	if (ctxt->fiemap)
+	if (ctxt->fiemap && ctxt->owns_fiemap)
 		free(ctxt->fiemap);
 
 	if (ctxt->file_csum)
@@ -1008,6 +1038,182 @@ static inline bool is_file_renamed(char *path_in_db, char *path)
 }
 
 /*
+ * Intra-file chunking (#88). A large file is split into chunks scanned in
+ * parallel on the scan pool; the last chunk to finish merges the per-chunk
+ * hashes, folds the file digest, and stores everything. Every chunk boundary
+ * sits on an extent end that is also blocksize-aligned, so each block and each
+ * extent stays wholly inside one chunk and a chunk is just scan_range() over
+ * [start, end). The file digest folds the same (loff, digest) sequence whether
+ * scanned whole or per-chunk, so chunking never changes a file's digest.
+ */
+struct scan_job {
+	char *path;
+	int64_t fileid;
+	size_t filesize;
+	struct fiemap *fiemap;		/* shared read-only; freed with the job */
+	unsigned int nchunks;
+	gint chunks_remaining;		/* atomic; whoever hits 0 runs the merge */
+	gint failed;			/* atomic; a chunk hit a read error/change */
+	size_t *bounds;			/* nchunks + 1 offsets: chunk i = [bounds[i], bounds[i+1]) */
+	struct hashes *chunk_hashes;	/* nchunks per-chunk results */
+};
+
+struct chunk_to_scan {
+	enum scan_kind kind;		/* SCAN_CHUNK */
+	struct scan_job *job;
+	unsigned int idx;
+};
+
+static bool chunk_job_release(struct scan_job *job, unsigned int k);
+static void merge_and_store(struct scan_job *job);
+static void free_job(struct scan_job *job);
+
+/*
+ * Target mapped bytes per chunk, or 0 to disable chunking. For now this is
+ * env-driven; the device-aware default and a --chunksize option come next.
+ */
+static size_t chunk_target_bytes(void)
+{
+	const char *e = getenv("DUPEREMOVE_CHUNK_BYTES");
+
+	return e ? strtoull(e, NULL, 10) : 0;
+}
+
+/*
+ * Split [0, filesize) into chunks of ~target mapped bytes, cutting only on
+ * blocksize-aligned extent ends so blocks and extents stay whole (and holes,
+ * costing no mapped bytes, are never a chunk on their own - this composes with
+ * the #87 hole-skip). Returns the chunk count (>= 1); when > 1 also returns a
+ * malloc'd bounds[count + 1]. Returns 1 (no chunking) when the file is too
+ * small or no usable, aligned split point exists (e.g. one huge extent).
+ */
+static unsigned int plan_chunks(struct fiemap *fiemap, size_t filesize,
+				size_t target, unsigned int max_chunks,
+				size_t **out_bounds)
+{
+	size_t *bounds;
+	unsigned int nchunks = 1;	/* bounds[0] = 0 is the first chunk's start */
+	size_t acc = 0;			/* mapped bytes since the last boundary */
+
+	if (target == 0 || max_chunks < 2 || filesize < 2 * target)
+		return 1;
+
+	/* At most one boundary per extent, plus the leading 0 and trailing EOF. */
+	bounds = malloc((fiemap->fm_mapped_extents + 2) * sizeof(*bounds));
+	if (!bounds)
+		return 1;
+
+	bounds[0] = 0;
+	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++) {
+		struct fiemap_extent *e = &fiemap->fm_extents[i];
+		size_t ee = e->fe_logical + e->fe_length;
+
+		acc += e->fe_length;
+		/* Cut here only on a blocksize-aligned extent end, past the target,
+		 * strictly before EOF, and while we can still add another chunk. */
+		if (acc >= target && ee % blocksize == 0 && ee < filesize &&
+		    nchunks < max_chunks) {
+			bounds[nchunks++] = ee;
+			acc = 0;
+		}
+	}
+
+	if (nchunks == 1) {		/* no usable split point */
+		free(bounds);
+		return 1;
+	}
+	bounds[nchunks] = filesize;	/* close the last chunk */
+	*out_bounds = bounds;
+	return nchunks;
+}
+
+/*
+ * Build a scan_job and queue its chunks. Takes ownership of path, fiemap and
+ * bounds. Returns 0, or 1 (fatal, like the whole-file push) if the pool rejects
+ * a chunk - abandoned chunks are still accounted so the merge runs and frees.
+ */
+static int schedule_chunked(char *path, int64_t fileid, size_t filesize,
+			    struct fiemap *fiemap, unsigned int nchunks,
+			    size_t *bounds)
+{
+	struct scan_job *job = calloc(1, sizeof(*job));
+
+	if (!job)
+		return 1;
+
+	job->path = path;
+	job->fileid = fileid;
+	job->filesize = filesize;
+	job->fiemap = fiemap;
+	job->nchunks = nchunks;
+	job->chunks_remaining = nchunks;
+	job->bounds = bounds;
+	job->chunk_hashes = calloc(nchunks, sizeof(struct hashes));
+	if (!job->chunk_hashes) {
+		free_job(job);
+		return 1;
+	}
+
+	for (unsigned int i = 0; i < nchunks; i++) {
+		struct chunk_to_scan *c = malloc(sizeof(*c));
+		GError *err = NULL;
+
+		if (c) {
+			c->kind = SCAN_CHUNK;
+			c->job = job;
+			c->idx = i;
+		}
+		if (!c || !g_thread_pool_push(scan_pool.pool, c, &err)) {
+			eprintf("g_thread_pool_push (chunk): %s\n",
+				err ? err->message : "out of memory");
+			if (err)
+				g_error_free(err);
+			free(c);
+			/* Account for this and every not-yet-queued chunk. */
+			if (chunk_job_release(job, nchunks - i))
+				merge_and_store(job);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * If chunking is enabled and the file is worth splitting, fiemap it, plan chunk
+ * boundaries and queue the chunks. Returns 0 (scheduled) or 1 (fatal push
+ * failure) if it took the file, or -1 to tell the caller to scan it whole. The
+ * stx_size gate keeps the small-file path fiemap-free.
+ */
+static int try_schedule_chunked(const char *path, int64_t fileid, size_t filesize)
+{
+	size_t target = chunk_target_bytes();
+	size_t *bounds = NULL;
+	struct fiemap *fm;
+	unsigned int nch;
+	int cfd;
+
+	if (!target || filesize < 2 * target)
+		return -1;
+
+	cfd = open(path, O_RDONLY);
+	if (cfd < 0)
+		return -1;
+	fm = do_fiemap(cfd);
+	close(cfd);
+	if (!fm)
+		return -1;
+
+	nch = plan_chunks(fm, filesize, target, options.io_threads, &bounds);
+	if (nch <= 1) {
+		free(fm);
+		return -1;
+	}
+
+	return schedule_chunked(strdup(path), fileid, filesize, fm, nch, bounds);
+}
+
+/*
  * Returns nonzero on fatal errors only
  * This function schedules csum_whole_file()
  * The caller must call check_file() before and must not call
@@ -1146,15 +1352,24 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	/* Remember this inode so later hardlinks to it are skipped. */
 	mark_inode_seen(dbfile.ino, dbfile.subvol);
 
-	/* Schedule the file for scan */
+	pscan_set_progress(1, st->stx_size);
+	position++;
+
+	/*
+	 * Try to split a large file into chunks scanned in parallel (#88); a file
+	 * that isn't taken (return < 0) falls through to a whole-file scan.
+	 */
+	int chunked = try_schedule_chunked(path, fileid, st->stx_size);
+	if (chunked >= 0)
+		return chunked;
+
+	/* Schedule the whole file for scan */
 	file = malloc(sizeof(struct file_to_scan)); /* Freed by csum_whole_file() */
 
+	file->kind = SCAN_WHOLE;
 	file->path = strdup(path);
 	file->fileid = fileid;
 	file->filesize = st->stx_size;
-
-	pscan_set_progress(1, st->stx_size);
-	position++;
 	file->file_position = position;
 
 	if(!g_thread_pool_push(scan_pool.pool, file, &err)) {
@@ -1340,32 +1555,45 @@ static size_t next_hole_block(struct scan_ctxt *ctxt, size_t from)
 }
 
 /*
- * Hash one block and fold it into the file digest. The file digest is a running
- * checksum over each block's (loff, digest) in ascending-loff order, rather than
- * a checksum of the file's raw bytes. This makes it:
+ * The one place the file digest is defined: fold a block's (loff, digest) into
+ * a running checksum. The file digest is this fold over every block in
+ * ascending-loff order, rather than a checksum of the file's raw bytes, which
+ * makes it:
  *  - layout-independent (a block is a fixed blocksize file-offset window, not a
  *    physical extent), so two byte-identical files digest equal regardless of
  *    fragmentation - required for whole-file dedup;
- *  - chunk-independent, so hashing a file in one pass or folding per-chunk block
- *    records in loff order yields the same digest (the enabler for #88);
+ *  - chunk-independent, so streaming the fold in one pass or folding per-chunk
+ *    block records in loff order yields the same digest (the enabler for #88);
  *  - hole-aware: skipped blocks (holes / UNWRITTEN / zeroes) leave gaps in loff,
  *    so different sparse layouts over identical data still differ (#87).
- * Folding streams as we scan (O(1) memory); block records are only retained for
- * block-level dedup storage. loff is folded host-endian: the digest is a local,
- * schema-versioned cache value, recomputed on any rebuild.
+ * loff is folded host-endian: the digest is a local, schema-versioned cache
+ * value, recomputed on any rebuild.
+ */
+static inline void fold_block_digest(struct running_checksum *c, uint64_t loff,
+				     const unsigned char *digest)
+{
+	add_to_running_checksum(c, (unsigned char *)&loff, sizeof(loff));
+	add_to_running_checksum(c, (unsigned char *)digest, DIGEST_LEN);
+}
+
+/*
+ * Hash one block, folding it into the file digest and/or retaining the record.
+ * A whole-file scan streams the fold as it goes (ctxt->file_csum set,
+ * O(1) memory); a chunk leaves file_csum NULL and retains the record so the
+ * merge can fold every chunk's blocks in loff order (same digest). Records are
+ * also retained when block-level dedup needs them stored.
  */
 static int process_block(struct scan_ctxt *ctxt, char *buf, unsigned int bsize,
 		size_t file_off, struct hashes *hashes)
 {
 	unsigned char digest[DIGEST_LEN];
-	uint64_t loff = file_off;
 
 	checksum_block(buf, bsize, digest);
 
-	add_to_running_checksum(ctxt->file_csum, (unsigned char *)&loff, sizeof(loff));
-	add_to_running_checksum(ctxt->file_csum, digest, DIGEST_LEN);
+	if (ctxt->file_csum)
+		fold_block_digest(ctxt->file_csum, file_off, digest);
 
-	if (options.do_block_hash)
+	if (ctxt->retain_blocks)
 		return add_block_hash(hashes, file_off, digest);
 	return 0;
 }
@@ -1590,18 +1818,182 @@ static int fill_buffer(struct scan_ctxt *ctxt, struct buffer *buffer)
 	return buffer->dl_len;
 }
 
-static inline bool is_inlined(struct scan_ctxt *ctxt)
+static inline bool fiemap_is_inlined(struct fiemap *fiemap, size_t filesize)
 {
 	struct fiemap_extent *extent;
 
-	extent = get_extent(ctxt->fiemap, ctxt->filesize - 1, NULL);
+	extent = get_extent(fiemap, filesize - 1, NULL);
 	return extent && extent->fe_flags & FIEMAP_EXTENT_DATA_INLINE;
+}
+
+/*
+ * Store one range's block and extent hashes. Blocks are stored only for
+ * block-level dedup (a chunk retains them regardless, to feed the file digest -
+ * so gate on do_block_hash, not on blocks_index) and never for an inlined file:
+ * https://github.com/markfasheh/duperemove/issues/316. The caller holds the
+ * write lock inside an open scan_write transaction. Returns 0, or -1 having
+ * already aborted the transaction.
+ */
+static int store_hashes(struct dbhandle *db, int64_t fileid,
+			struct hashes *hashes, bool inlined)
+{
+	if (options.do_block_hash && hashes->blocks_index != 0 && !inlined) {
+		if (dbfile_store_block_hashes(db, fileid, hashes->blocks_index,
+					      hashes->blocks)) {
+			scan_write_abort();
+			return -1;
+		}
+	}
+
+	if (hashes->extents_index != 0) {
+		if (dbfile_store_extent_hashes(db, fileid, hashes->extents_index,
+					       hashes->extents)) {
+			scan_write_abort();
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Commit a scanned file in one write transaction: store each range's block and
+ * extent hashes (one range for a whole-file scan, one per chunk for a merge),
+ * then stamp the file digest and the INLINED flag (deduping an inlined file
+ * never succeeds and wastes work: markfasheh/duperemove#316). tprogress may be
+ * NULL - the chunk merge has no display slot of its own.
+ */
+static void commit_file(struct dbhandle *db, int64_t fileid,
+			struct hashes *ranges, unsigned int nranges,
+			unsigned char *digest, bool inlined,
+			struct pscan_thread *tprogress)
+{
+	if (tprogress)
+		tprogress->status = thread_waiting_lock;
+	dbfile_lock();
+	if (tprogress)
+		tprogress->status = thread_committing;
+
+	if (scan_write_begin()) {
+		dbfile_unlock();
+		return;
+	}
+
+	for (unsigned int i = 0; i < nranges; i++) {
+		if (store_hashes(db, fileid, &ranges[i], inlined)) {
+			dbfile_unlock();
+			return;
+		}
+	}
+
+	if (dbfile_update_scanned_file(db, fileid, digest,
+				       inlined ? FILE_INLINED : 0)) {
+		scan_write_abort();
+		dbfile_unlock();
+		return;
+	}
+
+	if (scan_write_end()) {
+		dbfile_unlock();
+		return;
+	}
+	dbfile_unlock();
+}
+
+/*
+ * Scan ctxt->off .. ctxt->filesize, hashing each block (folded into the file
+ * digest and/or retained per ctxt) and each extent into `hashes`. A chunk sets
+ * ctxt->off/filesize to its [start, end); end sits on a block-aligned extent
+ * boundary so blocks and extents stay whole and the hole-skip (#87) treats end
+ * as EOF. Returns 0, or -1 on a read error or if the file changed under us
+ * (both already logged).
+ */
+static int scan_range(struct scan_ctxt *ctxt, struct hashes *hashes,
+		      struct buffer *buffer, struct pscan_thread *tprogress,
+		      const char *path)
+{
+	bool eof_reached = false;
+	int ret;
+
+	while (ctxt->off < ctxt->filesize) {
+		/*
+		 * How many bytes of the buffer are processed as whole blocks;
+		 * extent processing will not consume more than that.
+		 */
+		ssize_t bytes_processed = 0;
+
+		/*
+		 * Skip runs of all-hole blocks without reading or hashing them.
+		 * Holes contribute no block hashes, so they leave a gap in the
+		 * block loff sequence - that gap is what makes two files with
+		 * identical data but different sparse layout digest differently
+		 * (see fold_block_digest), so nothing needs folding here.
+		 */
+		size_t hole = hole_run_at(ctxt);
+		if (hole) {
+			ctxt->off += hole;
+			tprogress->file_scanned_bytes += hole;
+			tprogress->total_scanned_bytes += hole;
+			continue;
+		}
+
+		ret = fill_buffer(ctxt, buffer);
+		if (ret < 0) {
+			eprintf("Unable to read file %s: %s\n",
+				path, strerror(errno));
+			return -1;
+		}
+
+		if (ret == 0)
+			eof_reached = true;
+
+		bytes_processed = process_blocks(ctxt, buffer, hashes);
+		if (bytes_processed < 0) {
+			eprintf("process_blocks failed somehow\n");
+			return -1;
+		}
+
+		tprogress->file_scanned_bytes += bytes_processed;
+		tprogress->total_scanned_bytes += bytes_processed;
+
+		/* Process the last partial block */
+		if (eof_reached && (size_t)bytes_processed < buffer->dl_len) {
+			ret = process_block(ctxt, buffer->buf + bytes_processed,
+					    buffer->dl_len - bytes_processed,
+					    ctxt->off + bytes_processed, hashes);
+			if (ret) {
+				eprintf("Unable to process %s's last block\n", path);
+				return -1;
+			}
+
+			bytes_processed += buffer->dl_len - bytes_processed;
+		}
+
+		if (!options.only_whole_files) {
+			ret = process_extents(ctxt, buffer, hashes, bytes_processed);
+			if (ret)
+				break;
+		}
+
+		buffer->dl_offset = bytes_processed;
+		buffer->dl_len -= bytes_processed;
+
+		/* Ack the processed data and move the current offset accordingly */
+		ctxt->off += bytes_processed;
+
+		if (eof_reached)
+			/* File may have changed */
+			break;
+	}
+
+	if (ctxt->off != ctxt->filesize) {
+		eprintf("file %s changed\n", path);
+		return -1;
+	}
+	return 0;
 }
 
 static void csum_whole_file(struct file_to_scan *file)
 {
-	int ret = 0;
-
 	_cleanup_(free_hashes) struct hashes hashes = {0,};
 	_cleanup_(free_scan_ctxt) struct scan_ctxt ctxt = {0,};
 	unsigned char file_digest[DIGEST_LEN];
@@ -1618,25 +2010,11 @@ static void csum_whole_file(struct file_to_scan *file)
 	_cleanup_(freep) char *path = file->path;
 	_cleanup_(freep) struct file_to_scan *clean_file = file;
 
-	/* Used to detected eof if file changed since
-	 * we stat() it
-	 */
-	bool eof_reached = false;
-
 	/* Prevent close on fd 0 if, somehow, an error occurs before we open */
 	ctxt.fd = -1;
 
-	if (!(buffer.buf)) {
-		ret = prepare_buffer(&buffer);
-		if (ret) {
-			eprintf("unable to prepare our read buffer\n");
-			return;
-		}
-	} else {
-		/* Clean leftovers from another call */
-		buffer.dl_offset = 0;
-		buffer.dl_len = 0;
-	}
+	if (reset_buffer(&buffer))
+		return;
 
 	if (!db) {
 		eprintf("csum_whole_file: unable to connect to the database\n");
@@ -1669,98 +2047,18 @@ static void csum_whole_file(struct file_to_scan *file)
 	ctxt.fiemap = do_fiemap(ctxt.fd);
 	if (!ctxt.fiemap)
 		return;
+	ctxt.owns_fiemap = true;
 
-	if (!allocate_hashes(&hashes, &ctxt)) {
+	if (!allocate_hashes(&hashes, ctxt.fiemap, 0, ctxt.filesize)) {
 		eprintf("allocate_hashes failed\n");
 		return;
 	}
 
-	/*
-	 * Main loop:
-	 * - grab some data into the buffer
-	 * - try to process as must entire blocks as possible (each folds into the
-	 *   file digest; see process_block)
-	 * - consume that amount of bytes for the extents
-	 * loop again until pread returns 0 or
-	 * until we reach the expected EOF, based on the expected filesize
-	 */
-	while (ctxt.off < ctxt.filesize) {
-		/* In the buffer, how much bytes are processed as blocks
-		 * Extents processing and file processing will not consumme
-		 * more than that amount of bytes
-		 */
-		ssize_t bytes_processed = 0;
+	/* A whole-file scan streams the digest and retains blocks only to store. */
+	ctxt.retain_blocks = options.do_block_hash;
 
-		/*
-		 * Skip runs of all-hole blocks without reading or hashing them.
-		 * Holes contribute no block hashes, so they leave a gap in the
-		 * block loff sequence - that gap is what makes two files with
-		 * identical data but different sparse layout digest differently
-		 * (see process_block), so nothing needs folding here.
-		 */
-		size_t hole = hole_run_at(&ctxt);
-		if (hole) {
-			ctxt.off += hole;
-			tprogress->file_scanned_bytes += hole;
-			tprogress->total_scanned_bytes += hole;
-			continue;
-		}
-
-		ret = fill_buffer(&ctxt, &buffer);
-		if (ret < 0) {
-			ret = errno;
-			eprintf("Unable to read file %s: %s\n",
-				file->path, strerror(ret));
-			return;
-		}
-
-		if (ret == 0)
-			eof_reached = true;
-
-		bytes_processed = process_blocks(&ctxt, &buffer, &hashes);
-		if (bytes_processed < 0) {
-			eprintf("process_blocks failed somehow\n");
-			return;
-		}
-
-		tprogress->file_scanned_bytes += bytes_processed;
-		tprogress->total_scanned_bytes += bytes_processed;
-
-		/* Process the last partial block */
-		if (eof_reached && (size_t)bytes_processed < buffer.dl_len) {
-			ret = process_block(&ctxt, buffer.buf + bytes_processed,
-					    buffer.dl_len - bytes_processed,
-					    ctxt.off + bytes_processed,
-					    &hashes);
-			if (ret) {
-				eprintf("Unable to process %s's last block\n", file->path);
-				return;
-			}
-
-			bytes_processed += buffer.dl_len - bytes_processed;
-		}
-
-		if (!options.only_whole_files) {
-			ret = process_extents(&ctxt, &buffer, &hashes, bytes_processed);
-			if (ret)
-				break;
-		}
-
-		buffer.dl_offset = bytes_processed;
-		buffer.dl_len -= bytes_processed;
-
-		/* Ack the processed data and move the current offset accordingly */
-		ctxt.off += bytes_processed;
-
-		if (eof_reached)
-			/* File may have change */
-			break;
-	}
-
-	if (ctxt.off != ctxt.filesize) {
-		eprintf("file %s changed\n", file->path);
+	if (scan_range(&ctxt, &hashes, &buffer, tprogress, file->path))
 		return;
-	}
 
 	finish_running_checksum(ctxt.file_csum, file_digest);
 	ctxt.file_csum = NULL;
@@ -1776,61 +2074,159 @@ static void csum_whole_file(struct file_to_scan *file)
 	 * Whether the last extent is inlined is a pure fiemap scan; compute it
 	 * once here rather than twice under the write lock below.
 	 */
-	bool inlined = is_inlined(&ctxt);
+	bool inlined = fiemap_is_inlined(ctxt.fiemap, ctxt.filesize);
 
-	tprogress->status = thread_waiting_lock;
-	dbfile_lock();
-	tprogress->status = thread_committing;
-	ret = scan_write_begin();
-	if (ret) {
-		dbfile_unlock();
-		return;
+	commit_file(db, file->fileid, &hashes, 1, file_digest, inlined, tprogress);
+}
+
+/* Atomically retire k chunks; returns true for the caller that reaches 0. */
+static bool chunk_job_release(struct scan_job *job, unsigned int k)
+{
+	return g_atomic_int_add(&job->chunks_remaining, -(gint)k) == (gint)k;
+}
+
+static void free_job(struct scan_job *job)
+{
+	if (job->chunk_hashes) {
+		for (unsigned int c = 0; c < job->nchunks; c++)
+			free_hashes(&job->chunk_hashes[c]);
+		free(job->chunk_hashes);
+	}
+	free(job->bounds);
+	free(job->fiemap);
+	free(job->path);
+	free(job);
+}
+
+/*
+ * Fold every chunk's blocks (already in ascending loff order, chunk by chunk)
+ * into the file digest and store all chunks' hashes under one write
+ * transaction. Runs once, on the last chunk to finish; frees the job.
+ */
+static void merge_and_store(struct scan_job *job)
+{
+	struct dbhandle *db = scan_writer;
+	unsigned char file_digest[DIGEST_LEN];
+	struct running_checksum *fc;
+	bool inlined;
+
+	/* A chunk hit a read error or the file changed: leave the digest NULL so
+	 * the file is re-scanned next run rather than stored half-hashed. */
+	if (g_atomic_int_get(&job->failed))
+		goto out;
+
+	fc = start_running_checksum();
+	if (!fc)
+		goto out;
+	for (unsigned int c = 0; c < job->nchunks; c++) {
+		struct hashes *h = &job->chunk_hashes[c];
+
+		for (unsigned int i = 0; i < h->blocks_index; i++)
+			fold_block_digest(fc, h->blocks[i].loff, h->blocks[i].digest);
+	}
+	finish_running_checksum(fc, file_digest);
+
+	inlined = fiemap_is_inlined(job->fiemap, job->filesize);
+
+	commit_file(db, job->fileid, job->chunk_hashes, job->nchunks,
+		    file_digest, inlined, NULL);
+out:
+	free_job(job);
+}
+
+/*
+ * Scan one chunk [bounds[idx], bounds[idx+1]) into its own hashes slot, sharing
+ * the job's fiemap. The digest is not folded here - the merge does that once all
+ * chunks are in, so per-chunk order doesn't matter. The last chunk to finish
+ * runs the merge.
+ */
+static void csum_chunk(struct chunk_to_scan *chunk)
+{
+	struct scan_job *job = chunk->job;
+	unsigned int idx = chunk->idx;
+	size_t start = job->bounds[idx];
+	size_t end = job->bounds[idx + 1];
+	struct hashes *hashes = &job->chunk_hashes[idx];
+
+	_cleanup_(free_scan_ctxt) struct scan_ctxt ctxt = {0,};
+	_cleanup_(pscan_reset_thread) struct pscan_thread *tprogress = NULL;
+	static __thread struct buffer buffer = {0,};
+
+	free(chunk);	/* the work item; the job outlives it until the merge */
+
+	ctxt.fd = -1;
+	ctxt.fiemap = job->fiemap;	/* shared: owns_fiemap stays false */
+	ctxt.filesize = end;		/* the chunk's end is its EOF for the scan */
+	ctxt.off = start;
+	ctxt.file_csum = NULL;		/* the merge folds the digest */
+	ctxt.retain_blocks = true;	/* retained for the merge */
+
+	/* Claim the slot first so the barrier bookkeeping below always has it. */
+	tprogress = pscan_claim_slot(gettid(), thread_scanning);
+	abort_on(!tprogress);
+	tprogress->file_scanned_bytes = 0;
+	tprogress->file_total_bytes = end - start;
+	strncpy(tprogress->file_path, job->path, PATH_MAX);
+
+	if (reset_buffer(&buffer))
+		goto fail;
+
+	ctxt.fd = open(job->path, O_RDONLY);
+	if (ctxt.fd == -1) {
+		eprintf("csum_chunk: Error %d: %s while opening \"%s\". Skipping.\n",
+			errno, strerror(errno), job->path);
+		goto fail;
+	}
+	posix_fadvise(ctxt.fd, start, end - start, POSIX_FADV_SEQUENTIAL);
+
+	if (!allocate_hashes(hashes, job->fiemap, start, end)) {
+		eprintf("allocate_hashes failed\n");
+		goto fail;
 	}
 
-	/*
-	 * Block records are retained (by process_block) only in block-dedup mode;
-	 * the file digest itself is folded as we scan and needs no array. Never
-	 * store blocks for an inlined file.
-	 */
-	if (hashes.blocks_index != 0 && !inlined) {
-		ret = dbfile_store_block_hashes(db, file->fileid,
-						hashes.blocks_index, hashes.blocks);
-		if (ret) {
-			scan_write_abort();
-			dbfile_unlock();
-			return;
-		}
+	if (scan_range(&ctxt, hashes, &buffer, tprogress, job->path))
+		goto fail;
+
+	posix_fadvise(ctxt.fd, start, end - start, POSIX_FADV_DONTNEED);
+	goto done;
+
+fail:
+	g_atomic_int_set(&job->failed, 1);
+done:
+	{
+		/*
+		 * The last chunk to finish counts the whole file (once) and runs
+		 * the merge; the others must not bump the scanned-file count or
+		 * the progress total would never be reached.
+		 */
+		bool last = chunk_job_release(job, 1);
+
+		tprogress->count_as_file = last;
+		/*
+		 * merge_and_store frees the job (including job->fiemap). Our ctxt
+		 * still aliases that fiemap, but owns_fiemap is false so cleanup
+		 * won't free it, and nothing below touches it.
+		 */
+		if (last)
+			merge_and_store(job);
 	}
+}
 
+/*
+ * The dispatcher reads the scan_kind tag through a bare void*, so it must be the
+ * first member of every work-item struct. Lock that invariant at compile time.
+ */
+_Static_assert(offsetof(struct file_to_scan, kind) == 0,
+	       "scan_kind must be the first member of file_to_scan");
+_Static_assert(offsetof(struct chunk_to_scan, kind) == 0,
+	       "scan_kind must be the first member of chunk_to_scan");
 
-	if (hashes.extents_index != 0) {
-		ret = dbfile_store_extent_hashes(db, file->fileid, hashes.extents_index, hashes.extents);
-		if (ret) {
-			scan_write_abort();
-			dbfile_unlock();
-			return;
-		}
-	}
-
-	/* Flag the file if its last extent is INLINED.
-	 * Attempt to deduplicate those will never succeed and will produce a lot
-	 * of needless work: https://github.com/markfasheh/duperemove/issues/316
-	 */
-	ret = dbfile_update_scanned_file(db, file->fileid, file_digest,
-			inlined ? FILE_INLINED : 0);
-	if (ret) {
-		scan_write_abort();
-		dbfile_unlock();
-		return;
-	}
-
-	ret = scan_write_end();
-	if (ret) {
-		dbfile_unlock();
-		return;
-	}
-
-	dbfile_unlock();
+static void csum_scan_dispatch(void *item)
+{
+	if (*(enum scan_kind *)item == SCAN_CHUNK)
+		csum_chunk(item);
+	else
+		csum_whole_file(item);
 }
 
 int add_exclude_pattern(const char *pattern)
@@ -2080,7 +2476,7 @@ void filescan_init(void)
 	abort_on(scan_pool.pool);
 	abort_on(scan_writer_open());
 	seen_inodes_init();
-	setup_pool(&scan_pool, csum_whole_file, NULL, options.io_threads);
+	setup_pool(&scan_pool, csum_scan_dispatch, NULL, options.io_threads);
 	abort_on(!scan_pool.pool);
 }
 

@@ -59,7 +59,18 @@ struct extent_csum {
 	unsigned char	digest[DIGEST_LEN];
 };
 
+/*
+ * Work items on the scan pool are tagged so one pool can carry both whole-file
+ * scans and individual chunks of a large file (see csum_scan_dispatch). The tag
+ * must be the first member of every work-item struct.
+ */
+enum scan_kind {
+	SCAN_WHOLE = 0,		/* struct file_to_scan */
+	SCAN_CHUNK,		/* struct chunk_to_scan */
+};
+
 struct file_to_scan {
+	enum scan_kind kind;
 	char *path;
 	int64_t fileid;
 	size_t filesize;
