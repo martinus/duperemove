@@ -252,7 +252,7 @@ struct scan_ctxt {
 	size_t read_cap; /* offset of the next all-hole block: reads stop here (see fill_buffer) */
 	struct fiemap *fiemap;
 	unsigned int extent_cursor; /* resume hint for get_extent() in process_extents */
-	struct running_checksum *file_csum;
+	struct running_checksum *file_csum;  /* folds each block's (loff, digest); see process_block */
 	struct running_checksum *extent_csum;
 };
 
@@ -1339,12 +1339,35 @@ static size_t next_hole_block(struct scan_ctxt *ctxt, size_t from)
 	}
 }
 
-static int process_block(char *buf, unsigned int bsize,
+/*
+ * Hash one block and fold it into the file digest. The file digest is a running
+ * checksum over each block's (loff, digest) in ascending-loff order, rather than
+ * a checksum of the file's raw bytes. This makes it:
+ *  - layout-independent (a block is a fixed blocksize file-offset window, not a
+ *    physical extent), so two byte-identical files digest equal regardless of
+ *    fragmentation - required for whole-file dedup;
+ *  - chunk-independent, so hashing a file in one pass or folding per-chunk block
+ *    records in loff order yields the same digest (the enabler for #88);
+ *  - hole-aware: skipped blocks (holes / UNWRITTEN / zeroes) leave gaps in loff,
+ *    so different sparse layouts over identical data still differ (#87).
+ * Folding streams as we scan (O(1) memory); block records are only retained for
+ * block-level dedup storage. loff is folded host-endian: the digest is a local,
+ * schema-versioned cache value, recomputed on any rebuild.
+ */
+static int process_block(struct scan_ctxt *ctxt, char *buf, unsigned int bsize,
 		size_t file_off, struct hashes *hashes)
 {
 	unsigned char digest[DIGEST_LEN];
+	uint64_t loff = file_off;
+
 	checksum_block(buf, bsize, digest);
-	return add_block_hash(hashes, file_off, digest);
+
+	add_to_running_checksum(ctxt->file_csum, (unsigned char *)&loff, sizeof(loff));
+	add_to_running_checksum(ctxt->file_csum, digest, DIGEST_LEN);
+
+	if (options.do_block_hash)
+		return add_block_hash(hashes, file_off, digest);
+	return 0;
 }
 
 /*
@@ -1359,15 +1382,19 @@ static ssize_t process_blocks(struct scan_ctxt *ctxt, struct buffer *buffer,
 	unsigned int nb_blocks = buffer->dl_len / blocksize;
 	size_t curr_file_off = ctxt->off;
 
-	/* We do not actually need to process the blocks */
-	if (!options.do_block_hash || buffer->faked)
+	/*
+	 * Block hashes are always computed: the file digest is folded from them
+	 * (see process_block), so we need them even when block-level dedup is off.
+	 * Faked buffers (holes / UNWRITTEN) contribute no blocks by design.
+	 */
+	if (buffer->faked)
 		return buffer->dl_len;
 
 	for (unsigned int i = 0; i < nb_blocks; i++) {
 		if (!is_block_ignored(ctxt->fiemap, curr_file_off) &&
 		    !(options.skip_zeroes &&
 		      is_block_zeroed(buffer->buf + i * blocksize))) {
-			ret = process_block(buffer->buf + i * blocksize,
+			ret = process_block(ctxt, buffer->buf + i * blocksize,
 					    blocksize, curr_file_off, hashes);
 			if (ret)
 				return ret;
@@ -1651,8 +1678,8 @@ static void csum_whole_file(struct file_to_scan *file)
 	/*
 	 * Main loop:
 	 * - grab some data into the buffer
-	 * - try to process as must entire blocks as possible
-	 * - consume that amount of bytes for the file csum
+	 * - try to process as must entire blocks as possible (each folds into the
+	 *   file digest; see process_block)
 	 * - consume that amount of bytes for the extents
 	 * loop again until pread returns 0 or
 	 * until we reach the expected EOF, based on the expected filesize
@@ -1666,19 +1693,13 @@ static void csum_whole_file(struct file_to_scan *file)
 
 		/*
 		 * Skip runs of all-hole blocks without reading or hashing them.
-		 * Rather than fold the hole's zero bytes into the file checksum
-		 * (the whole point is not to touch them), fold a cheap
-		 * (offset, length) descriptor so two files with identical data
-		 * but different sparse layout still produce different digests.
-		 * (Preallocated UNWRITTEN/INLINE extents deliberately keep the
-		 * older faked-zeroes path in fill_buffer instead; unifying the
-		 * two would change preallocated files' digests for no gain here.)
+		 * Holes contribute no block hashes, so they leave a gap in the
+		 * block loff sequence - that gap is what makes two files with
+		 * identical data but different sparse layout digest differently
+		 * (see process_block), so nothing needs folding here.
 		 */
 		size_t hole = hole_run_at(&ctxt);
 		if (hole) {
-			uint64_t desc[2] = { ctxt.off, hole };
-			add_to_running_checksum(ctxt.file_csum,
-						(unsigned char *)desc, sizeof(desc));
 			ctxt.off += hole;
 			tprogress->file_scanned_bytes += hole;
 			tprogress->total_scanned_bytes += hole;
@@ -1707,7 +1728,7 @@ static void csum_whole_file(struct file_to_scan *file)
 
 		/* Process the last partial block */
 		if (eof_reached && (size_t)bytes_processed < buffer.dl_len) {
-			ret = process_block(buffer.buf + bytes_processed,
+			ret = process_block(&ctxt, buffer.buf + bytes_processed,
 					    buffer.dl_len - bytes_processed,
 					    ctxt.off + bytes_processed,
 					    &hashes);
@@ -1718,8 +1739,6 @@ static void csum_whole_file(struct file_to_scan *file)
 
 			bytes_processed += buffer.dl_len - bytes_processed;
 		}
-
-		add_to_running_checksum(ctxt.file_csum, (unsigned char*)(buffer.buf), bytes_processed);
 
 		if (!options.only_whole_files) {
 			ret = process_extents(&ctxt, &buffer, &hashes, bytes_processed);
@@ -1768,7 +1787,11 @@ static void csum_whole_file(struct file_to_scan *file)
 		return;
 	}
 
-	/* Do not store the blocks if the file is inlined */
+	/*
+	 * Block records are retained (by process_block) only in block-dedup mode;
+	 * the file digest itself is folded as we scan and needs no array. Never
+	 * store blocks for an inlined file.
+	 */
 	if (hashes.blocks_index != 0 && !inlined) {
 		ret = dbfile_store_block_hashes(db, file->fileid,
 						hashes.blocks_index, hashes.blocks);

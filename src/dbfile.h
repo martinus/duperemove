@@ -24,7 +24,7 @@ struct dbfile_config;
  * a version number.
  */
 #define DB_FILE_MAJOR	5
-#define DB_FILE_MINOR	0
+#define DB_FILE_MINOR	1
 
 /*
  * SQLite application_id stamped into every oans hashfile ("oans" in ASCII).
