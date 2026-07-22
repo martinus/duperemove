@@ -246,10 +246,13 @@ static unsigned int print_scan_progress(void)
 		return 3;
 	}
 
+	/* Files/s, reused by the file-rate ETA below; 0 until we have a second. */
+	double frate = (files_scanned && elapsed > 1.0) ? files_scanned / elapsed : 0.0;
+
 	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)",
 	      files_scanned, tf, tf ? (double)files_scanned / tf * 100 : 100.0);
-	if (files_scanned && elapsed > 1.0)
-		printf(" · %.0f files/s", files_scanned / elapsed);
+	if (frate > 0.0)
+		printf(" · %.0f files/s", frate);
 	printf("\n");
 
 	s_printf("\tBytes scanned: %s/%s (%05.2f%%)",
@@ -271,9 +274,8 @@ static unsigned int print_scan_progress(void)
 		 */
 		if (bytes_scanned < tb)
 			eta = (tb - bytes_scanned) / brate;
-		if (files_scanned && files_scanned < tf) {
-			double feta = (tf - files_scanned) /
-				       (files_scanned / elapsed);
+		if (frate > 0.0 && files_scanned < tf) {
+			double feta = (tf - files_scanned) / frate;
 
 			if (feta > eta)
 				eta = feta;
@@ -453,29 +455,15 @@ void pscan_join(void)
 
 void pscan_reset_thread(struct pscan_thread **progress)
 {
-	if (!progress || !*progress)
-		return;
-	uint64_t scanned = (*progress)->file_scanned_bytes;
-	uint64_t total = (*progress)->file_total_bytes;
-
-	(*progress)->status = thread_idle;
 	/*
-	 * The file may have shrinked between the statx and
-	 * the end of the scan.
-	 * Does not matter much, we fake-fill the missing bytes
-	 * so the global progress don't diverge much
+	 * The churning dedupe pool re-claims a slot per work item, so its reset
+	 * is just "finish this file's accounting, then park the slot idle" - the
+	 * two persistent-slot primitives composed, so the byte reconciliation has
+	 * a single source of truth.
 	 */
-	if (scanned < total)
-		(*progress)->total_scanned_bytes += total - scanned;
-
-	/*
-	 * Also, the file may have grow.
-	 */
-	if (scanned > total)
-		(*progress)->total_scanned_bytes -= scanned - total;
-
-	(*progress)->total_scanned_files++;
-	(*progress)->file_path[0] = '\0';
+	pscan_finish_file(progress);
+	if (progress && *progress)
+		pscan_slot_idle(*progress);
 }
 
 /*
@@ -495,6 +483,11 @@ void pscan_finish_file(struct pscan_thread **progress)
 	scanned = (*progress)->file_scanned_bytes;
 	total = (*progress)->file_total_bytes;
 
+	/*
+	 * The file may have shrunk between the statx and the end of the scan;
+	 * fake-fill the missing bytes so the global progress doesn't diverge.
+	 * It may also have grown, so trim the overshoot.
+	 */
 	if (scanned < total)
 		(*progress)->total_scanned_bytes += total - scanned;
 	if (scanned > total)
