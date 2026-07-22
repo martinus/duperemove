@@ -231,9 +231,6 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 
 ## Output and information
 
-**-h**
-  ~ Print sizes in human-readable units (KiB/MiB/GiB) rather than raw bytes.
-
 **-q**, **\--quiet**
   ~ Quiet: print only errors and a one-line dedupe summary. Suppresses the live
     progress display and the human summary block.
@@ -253,8 +250,9 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 **\--version**
   ~ Print the `oans` version and exit.
 
-**\--help**
-  ~ Show this manual page and exit.
+**-h**, **\--help**
+  ~ Print a short usage summary and exit. (For the full reference, read this
+    manual page: **man 8 oans**.)
 
 # OUTPUT
 
