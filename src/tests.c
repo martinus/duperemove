@@ -233,6 +233,56 @@ MU_TEST(test_storage_recommend_io_threads) {
 	mu_check(storage_recommend_io_threads(&p, 0) == 1);
 }
 
+MU_TEST(test_scan_bucket) {
+	/* Boundaries: <1 MiB => 0, then one bucket per power of two above 1 MiB. */
+	mu_check(scan_bucket(0) == 0);
+	mu_check(scan_bucket(1) == 0);
+	mu_check(scan_bucket((1u << 20) - 1) == 0);		/* just under 1 MiB */
+	mu_check(scan_bucket(1u << 20) == 1);			/* 1 MiB (2^20) */
+	mu_check(scan_bucket((1u << 21) - 1) == 1);		/* just under 2 MiB */
+	mu_check(scan_bucket(1u << 21) == 2);			/* 2 MiB */
+	mu_check(scan_bucket(1u << 22) == 3);			/* 4 MiB */
+	mu_check(scan_bucket(1u << 24) == 5);			/* 16 MiB */
+	mu_check(scan_bucket(100ull << 20) == 7);		/* 100 MiB (2^26 top bit) */
+	mu_check(scan_bucket(8ull << 30) == 14);		/* 8 GiB (2^33) */
+	/* Even the largest possible size stays a valid bucket index. */
+	mu_check(scan_bucket(~0ull) == 44);			/* 2^63 top bit */
+	mu_check(scan_bucket(~0ull) < SCAN_NBUCKETS);
+}
+
+MU_TEST(test_scan_workq_priority) {
+	/*
+	 * A free thread must take the largest-bucket work first, FIFO (walk order)
+	 * within a bucket. Drive scan_workq_push/pop directly (no workers): with
+	 * items queued, pop() returns immediately in dispatch order.
+	 */
+	memset(&scan_workq, 0, sizeof(scan_workq));
+
+	struct file_to_scan files[] = {
+		{ .filesize = 512u << 10, .file_position = 1 },	/* 512 KiB -> b0 */
+		{ .filesize = 8u << 20,   .file_position = 2 },	/* 8 MiB   -> b4 */
+		{ .filesize = 2u << 20,   .file_position = 3 },	/* 2 MiB   -> b2 */
+		{ .filesize = 8u << 20,   .file_position = 4 },	/* 8 MiB   -> b4 */
+		{ .filesize = 100u << 20, .file_position = 5 },	/* 100 MiB -> b7 */
+	};
+	for (unsigned int i = 0; i < G_N_ELEMENTS(files); i++)
+		scan_workq_push(&files[i]);
+
+	/* Biggest bucket first; within b4, FIFO keeps pos2 before pos4. */
+	struct file_to_scan *f;
+	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 5);	/* b7 */
+	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 2);	/* b4 */
+	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 4);	/* b4 */
+	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 3);	/* b2 */
+	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 1);	/* b0 */
+
+	/* Empty + draining => pop returns NULL (worker would exit). */
+	scan_workq.draining = true;
+	mu_check(scan_workq_pop(&scan_workq) == NULL);
+
+	memset(&scan_workq, 0, sizeof(scan_workq));
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -241,6 +291,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_get_extent);
 	MU_RUN_TEST(test_sanitize_ctrl);
 	MU_RUN_TEST(test_storage_recommend_io_threads);
+	MU_RUN_TEST(test_scan_bucket);
+	MU_RUN_TEST(test_scan_workq_priority);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

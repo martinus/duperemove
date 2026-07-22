@@ -69,6 +69,9 @@ struct file_to_scan {
 	 * to print the progress bar
 	 */
 	unsigned long long file_position;
+
+	/* Intrusive FIFO link, owned by the scan work queue (file_scan.c). */
+	struct file_to_scan *next;
 };
 
 int add_exclude_pattern(const char *pattern);
