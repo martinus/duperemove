@@ -76,8 +76,78 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st);
 static bool seen_inode(uint64_t ino, uint64_t subvol);
 static void mark_inode_seen(uint64_t ino, uint64_t subvol);
 static void mark_file_seen(int64_t id);
+struct buffer;
+static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer);
 
-static struct threads_pool scan_pool;
+/*
+ * Scan work queue — approximate longest-processing-time-first (LPT) dispatch.
+ *
+ * Files are queued as the walk discovers them and hashing starts immediately,
+ * exactly as before, but a free csum thread always takes work from the largest
+ * non-empty size class first. That keeps every thread busy and avoids the
+ * failure mode where a huge file happens to be the last thing left and hashes
+ * single-threaded while the other threads sit idle.
+ *
+ * Rather than order files exactly, they are bucketed by size on a log scale:
+ * bucket 0 is everything <1 MiB, then one bucket per power of two above that
+ * (1 MiB, 2 MiB, 4 MiB, …). Each bucket is an intrusive FIFO (walk order
+ * preserved within a class) and a 64-bit occupancy bitmask names the non-empty
+ * buckets, so both push and pop are O(1): pop finds the top bucket with a single
+ * count-leading-zeros on the mask, never a scan over buckets. A huge file sits
+ * alone in a high bucket and is therefore dispatched first; the only slack vs
+ * exact LPT is the <2× size spread within one bucket, which does not matter for
+ * the idle-tail we are avoiding. On a tree of only small files everything lands
+ * in bucket 0 and this degrades to plain FIFO at zero cost.
+ */
+/*
+ * Files smaller than the floor all share bucket 0. Below this size, ordering by
+ * size can't help makespan (a sub-floor file hashes in well under a millisecond,
+ * so it is never the straggler LPT avoids) and keeping them in one FIFO
+ * preserves walk-order read locality. Above the floor: one bucket per power of
+ * two. Raise the floor to reorder fewer files; lower it only for a measured
+ * reason.
+ */
+#define SCAN_BUCKET_FLOOR_LOG2 20	/* 1 MiB */
+#define SCAN_NBUCKETS 64		/* bucket 0 plus one per power of two; fits a u64 mask */
+
+/* Index of the highest set bit; x must be non-zero. */
+static inline unsigned highest_set_bit(uint64_t x)
+{
+	return 63 - __builtin_clzll(x);
+}
+
+static inline unsigned scan_bucket(uint64_t size)
+{
+	if (size < (1ULL << SCAN_BUCKET_FLOOR_LOG2))	/* below the floor -> bucket 0 */
+		return 0;
+	/* size >= floor here, so highest_set_bit's precondition holds */
+	return highest_set_bit(size) - (SCAN_BUCKET_FLOOR_LOG2 - 1); /* floor->1, 2*floor->2, ... */
+}
+
+/*
+ * A uint64_t size has its top bit at position <= 63, so the largest possible
+ * bucket is 63 - (SCAN_BUCKET_FLOOR_LOG2 - 1). It must index the head/tail
+ * arrays and fit the u64 occupancy mask; this guards the invariant if the floor
+ * or bucket count change.
+ */
+_Static_assert(63 - (SCAN_BUCKET_FLOOR_LOG2 - 1) < SCAN_NBUCKETS,
+	       "largest scan bucket must fit SCAN_NBUCKETS");
+
+struct scan_workq {
+	GMutex lock;
+	GCond cond;			/* signalled on push and on drain */
+	struct file_to_scan *head[SCAN_NBUCKETS];	/* per-bucket FIFO */
+	struct file_to_scan *tail[SCAN_NBUCKETS];
+	uint64_t occupied;		/* bit b set iff bucket b is non-empty */
+	GThread **workers;
+	unsigned int nworkers;
+	bool draining;			/* no more pushes; drain, then workers exit */
+};
+static struct scan_workq scan_workq;
+
+static void scan_workq_push(struct file_to_scan *file);
+static void scan_workq_start(unsigned int nworkers);
+static void scan_workq_drain(void);
 
 /*
  * Scan-phase batched writer.
@@ -202,7 +272,7 @@ static void scan_writer_close(void)
 }
 
 /*
- * Per-read-thread streaming buffer (one static __thread buffer per csum thread,
+ * Per-worker streaming read buffer (each scan worker owns one struct buffer,
  * reused across files). Files larger than this are read in successive passes, so
  * the size only trades read() syscall count against memory: at --io-threads=8
  * the old 8 MiB cost 64 MiB of resident buffers on large-file trees. 1 MiB
@@ -340,8 +410,6 @@ static int prepare_buffer(struct buffer *buffer)
 		goto err;
 
 	buffer->size = READ_BUF_LEN;
-
-	register_cleanup(&scan_pool, (void*)&free, buffer->buf);
 	return 0;
 
 err:
@@ -1018,7 +1086,6 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	int ret;
 	struct file dbfile = {0,};
 	static unsigned int seq = 0, counter = 0;
-	GError *err = NULL;
 	struct file_to_scan *file;
 	int64_t fileid = 0;
 	bool file_renamed;
@@ -1157,13 +1224,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	position++;
 	file->file_position = position;
 
-	if(!g_thread_pool_push(scan_pool.pool, file, &err)) {
-		eprintf("g_thread_pool_push: %s\n", err->message);
-		g_error_free(err);
-		err = NULL;
-		free(file);
-		return 1;
-	}
+	scan_workq_push(file);
 
 	return 0;
 }
@@ -1571,7 +1632,102 @@ static inline bool is_inlined(struct scan_ctxt *ctxt)
 	return extent && extent->fe_flags & FIEMAP_EXTENT_DATA_INLINE;
 }
 
-static void csum_whole_file(struct file_to_scan *file)
+/*
+ * Queue a file for hashing. Called only from the single __scan_file() consumer.
+ * O(1): append to the tail of its size bucket and mark the bucket occupied.
+ */
+static void scan_workq_push(struct file_to_scan *file)
+{
+	struct scan_workq *q = &scan_workq;
+	unsigned b = scan_bucket(file->filesize);
+
+	file->next = NULL;
+	g_mutex_lock(&q->lock);
+	if (q->occupied & (1ULL << b))
+		q->tail[b]->next = file;
+	else
+		q->head[b] = file;
+	q->tail[b] = file;
+	q->occupied |= (1ULL << b);
+	g_cond_signal(&q->cond);
+	g_mutex_unlock(&q->lock);
+}
+
+/* Pop from the largest non-empty bucket, or NULL once drained. Blocks. O(1). */
+static struct file_to_scan *scan_workq_pop(struct scan_workq *q)
+{
+	struct file_to_scan *file;
+	unsigned b;
+
+	g_mutex_lock(&q->lock);
+	while (q->occupied == 0 && !q->draining)
+		g_cond_wait(&q->cond, &q->lock);
+	if (q->occupied == 0) {
+		g_mutex_unlock(&q->lock);
+		return NULL;		/* draining and empty: worker exits */
+	}
+	b = highest_set_bit(q->occupied);	/* biggest non-empty bucket */
+	file = q->head[b];
+	q->head[b] = file->next;
+	if (!q->head[b]) {
+		q->tail[b] = NULL;
+		q->occupied &= ~(1ULL << b);
+	}
+	g_mutex_unlock(&q->lock);
+	return file;
+}
+
+static gpointer scan_worker(gpointer arg)
+{
+	struct scan_workq *q = arg;
+	struct file_to_scan *file;
+	/* One read buffer per worker, allocated on first use and reused across
+	 * files; owned here so it is freed when the worker exits. */
+	struct buffer buffer = {0,};
+
+	while ((file = scan_workq_pop(q)))
+		csum_whole_file(file, &buffer);
+
+	free(buffer.buf);
+	return NULL;
+}
+
+static void scan_workq_start(unsigned int nworkers)
+{
+	struct scan_workq *q = &scan_workq;
+
+	abort_on(q->workers);		/* not re-entrant */
+	if (nworkers < 1)
+		nworkers = 1;
+	q->draining = false;
+	q->occupied = 0;
+	q->workers = calloc(nworkers, sizeof(*q->workers));
+	abort_on(!q->workers);
+	for (unsigned int i = 0; i < nworkers; i++)
+		q->workers[i] = g_thread_new("csum", scan_worker, q);
+	q->nworkers = nworkers;
+}
+
+/* Signal end-of-input and wait for every queued file to finish hashing. */
+static void scan_workq_drain(void)
+{
+	struct scan_workq *q = &scan_workq;
+
+	g_mutex_lock(&q->lock);
+	q->draining = true;
+	g_cond_broadcast(&q->cond);
+	g_mutex_unlock(&q->lock);
+
+	for (unsigned int i = 0; i < q->nworkers; i++)
+		g_thread_join(q->workers[i]);
+
+	free(q->workers);
+	q->workers = NULL;
+	q->nworkers = 0;
+	/* All buckets are empty now (workers drained them); nothing to free. */
+}
+
+static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer)
 {
 	int ret = 0;
 
@@ -1584,7 +1740,6 @@ static void csum_whole_file(struct file_to_scan *file)
 	 * serialized (and batched) behind the write lock.
 	 */
 	struct dbhandle *db = scan_writer;
-	static __thread struct buffer buffer = {0,};
 
 	/* Dummy variables used to trigger the cleanup code */
 	_cleanup_(pscan_reset_thread) struct pscan_thread *tprogress = NULL;
@@ -1599,16 +1754,16 @@ static void csum_whole_file(struct file_to_scan *file)
 	/* Prevent close on fd 0 if, somehow, an error occurs before we open */
 	ctxt.fd = -1;
 
-	if (!(buffer.buf)) {
-		ret = prepare_buffer(&buffer);
+	if (!(buffer->buf)) {
+		ret = prepare_buffer(buffer);
 		if (ret) {
 			eprintf("unable to prepare our read buffer\n");
 			return;
 		}
 	} else {
 		/* Clean leftovers from another call */
-		buffer.dl_offset = 0;
-		buffer.dl_len = 0;
+		buffer->dl_offset = 0;
+		buffer->dl_len = 0;
 	}
 
 	if (!db) {
@@ -1685,7 +1840,7 @@ static void csum_whole_file(struct file_to_scan *file)
 			continue;
 		}
 
-		ret = fill_buffer(&ctxt, &buffer);
+		ret = fill_buffer(&ctxt, buffer);
 		if (ret < 0) {
 			ret = errno;
 			eprintf("Unable to read file %s: %s\n",
@@ -1696,7 +1851,7 @@ static void csum_whole_file(struct file_to_scan *file)
 		if (ret == 0)
 			eof_reached = true;
 
-		bytes_processed = process_blocks(&ctxt, &buffer, &hashes);
+		bytes_processed = process_blocks(&ctxt, buffer, &hashes);
 		if (bytes_processed < 0) {
 			eprintf("process_blocks failed somehow\n");
 			return;
@@ -1706,9 +1861,9 @@ static void csum_whole_file(struct file_to_scan *file)
 		tprogress->total_scanned_bytes += bytes_processed;
 
 		/* Process the last partial block */
-		if (eof_reached && (size_t)bytes_processed < buffer.dl_len) {
-			ret = process_block(buffer.buf + bytes_processed,
-					    buffer.dl_len - bytes_processed,
+		if (eof_reached && (size_t)bytes_processed < buffer->dl_len) {
+			ret = process_block(buffer->buf + bytes_processed,
+					    buffer->dl_len - bytes_processed,
 					    ctxt.off + bytes_processed,
 					    &hashes);
 			if (ret) {
@@ -1716,19 +1871,19 @@ static void csum_whole_file(struct file_to_scan *file)
 				return;
 			}
 
-			bytes_processed += buffer.dl_len - bytes_processed;
+			bytes_processed += buffer->dl_len - bytes_processed;
 		}
 
-		add_to_running_checksum(ctxt.file_csum, (unsigned char*)(buffer.buf), bytes_processed);
+		add_to_running_checksum(ctxt.file_csum, (unsigned char*)(buffer->buf), bytes_processed);
 
 		if (!options.only_whole_files) {
-			ret = process_extents(&ctxt, &buffer, &hashes, bytes_processed);
+			ret = process_extents(&ctxt, buffer, &hashes, bytes_processed);
 			if (ret)
 				break;
 		}
 
-		buffer.dl_offset = bytes_processed;
-		buffer.dl_len -= bytes_processed;
+		buffer->dl_offset = bytes_processed;
+		buffer->dl_len -= bytes_processed;
 
 		/* Ack the processed data and move the current offset accordingly */
 		ctxt.off += bytes_processed;
@@ -2054,16 +2209,15 @@ static void seen_inodes_free(void)
 
 void filescan_init(void)
 {
-	abort_on(scan_pool.pool);
+	abort_on(scan_workq.workers);
 	abort_on(scan_writer_open());
 	seen_inodes_init();
-	setup_pool(&scan_pool, csum_whole_file, NULL, options.io_threads);
-	abort_on(!scan_pool.pool);
+	scan_workq_start(options.io_threads);
 }
 
 void filescan_free(void)
 {
-	free_pool(&scan_pool);
+	scan_workq_drain();		/* wait for all queued files to finish */
 	/* All workers have joined: flush the batched reads and drop the writer. */
 	scan_read_flush();
 	scan_writer_close();
