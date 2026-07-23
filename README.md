@@ -45,7 +45,7 @@ Summary
 | ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* everything already shared. Rescanning a deduped 2M-file / 230 GiB tree: **~92 s with oans vs ~11 min with duperemove 0.15.2** (~7×). |
 | 🪄 **Zero-config re-runs** | The hashfile remembers your options, paths and excludes. After the first run, `oans --hashfile=FILE` — nothing else — replays it incrementally. |
 | ⏰ **Scheduling built in** | `sudo make install-systemd`, then `systemctl enable --now oans@data.timer`. Weekly dedupe at idle I/O priority, no cron scripts. |
-| 📊 **Statistics & history** | `--stats` shows what a hashfile holds and how much is duplicated; `--history` shows space actually reclaimed over time; `--json` exports metrics for dashboards. |
+| 📊 **Observability** | `--stats` shows what a hashfile holds and how much is duplicated; `--history` shows space actually reclaimed over time; `--json` exports metrics for dashboards; `--progress=json` streams live per-phase progress for monitoring scheduled runs. |
 | 🎯 **Honest reporting** | A clean, colorful live progress display (rate + ETA) and a summary that reports the disk space *actually freed* — not an inflated shared-extents figure. |
 | 🔒 **Hardened** | Fixes a data-loss-adjacent upstream bug (hardlinks could silently empty the hashfile), read-only report modes that are safe while a dedupe runs, and an integration suite CI runs against a real btrfs and XFS. |
 | 🤝 **Drop-in compatible** | The CLI is a close superset of duperemove's, and `make install` provides a `duperemove` compatibility symlink. |
@@ -116,6 +116,15 @@ These are read-only and safe to run while a scan or dedupe is in progress.
 So is Ctrl+C, by the way: hashes are committed every ~10 s, and a restart
 resumes where it left off.
 
+For **live** progress of a running scan/dedupe — feeding a dashboard or a status
+check instead of the interactive display — add `--progress=json`. It streams one
+JSON object per phase (about once a second) to stderr, ending with a `done`
+event, and leaves stdout untouched:
+
+```sh
+oans -qd --progress=json --hashfile=data.hash /srv/data 2>progress.jsonl
+```
+
 > [!TIP]
 > On compressed btrfs (e.g. zstd), `Reclaimed` is a **logical** figure — the
 > real disk space freed is smaller by roughly your compression ratio, because
@@ -175,8 +184,9 @@ Differences to know about:
 - **Hashfiles are not interchangeable.** oans brands its hashfile with its own
   SQLite `application_id`; oans and duperemove will each rebuild rather than
   read the other's. Hashfiles are only caches, so nothing is lost.
-- **CLI**: a few additions (`--stats`, `--history`, `--json`, `--autotune`,
-  `--min-filesize`, `--no-color`, `-q`), a few legacy/testing options removed.
+- **CLI**: a few additions (`--stats`, `--history`, `--json`, `--progress=json`,
+  `--autotune`, `--min-filesize`, `--no-color`, `-q`), a few legacy/testing
+  options removed.
 - Scripts that expect the `duperemove` binary keep working via the installed
   compatibility symlink, including the stable
   `net change in shared extents` output line.

@@ -118,6 +118,21 @@ oans --history --hashfile=/var/cache/oans/media.hash    # reclaimed over time
 oans --json    --hashfile=/var/cache/oans/media.hash    # metrics for a dashboard
 ```
 
+For **live** progress of a run in flight — to feed a dashboard or a health
+check rather than watch the terminal — run it with `--progress=json`. oans then
+streams one JSON object per phase (about once a second) to **stderr**, ending
+with a `{"event":"done", ...}` line, and leaves stdout alone:
+
+```sh
+oans -qd --progress=json --hashfile=/var/cache/oans/media.hash \
+    /srv/media 2>>/var/log/oans-media.jsonl
+```
+
+To capture that from the scheduled job, add `--progress=json` to the unit's
+command (`sudo systemctl edit oans@.service`); the JSON lines then land in the
+journal, where `journalctl -u oans@media.service -o cat` gives you a clean
+stream to parse.
+
 ## Notes for NAS users
 
 - **Run as root** so oans can read and re-extent every file in the tree.
