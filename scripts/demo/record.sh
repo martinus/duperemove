@@ -51,11 +51,13 @@ else
   exit 1
 fi
 
-# Optimize the GIF: a quality-neutral ~30% shrink for flat terminal colours.
+# Optimize the GIF: quantize to a small palette (a terminal cast uses only a
+# handful of colours) and lossy-compress — a large shrink with no visible loss,
+# which matters most for the longer cold-scan recording.
 if command -v gifsicle >/dev/null; then
-  gifsicle -O3 --lossy="$LOSSY" "$OUT" -o "$OUT.tmp" 2>/dev/null && mv -f "$OUT.tmp" "$OUT" || rm -f "$OUT.tmp"
+  gifsicle -O3 --colors 32 --lossy="$LOSSY" "$OUT" -o "$OUT.tmp" 2>/dev/null && mv -f "$OUT.tmp" "$OUT" || rm -f "$OUT.tmp"
 else
-  echo "note: install gifsicle to shrink the GIF (~30% smaller)." >&2
+  echo "note: install gifsicle to shrink the GIF." >&2
 fi
 
 # Tidy up the dataset (keep the gif).
