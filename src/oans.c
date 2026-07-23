@@ -1060,31 +1060,42 @@ static void process_duplicates(struct dbhandle *db)
 	passes = max > first_seq ? (max - first_seq + stride - 1) / stride : 0;
 
 	/*
-	 * Ensure the find-dupes indexes exist. Normally built at the end of the
-	 * scan; this covers read-only runs (no scan this invocation) and older
-	 * hashfiles. Best-effort: the indexes only speed up the lookups below,
-	 * which are correct without them, so a failure here (e.g. a read-only
-	 * hashfile) is logged by the callee but must not abort the dedupe.
+	 * Deferred post-scan prep, run under the live dedupe block (started just
+	 * below) so the seconds it can take on a big hashfile animate instead of
+	 * freezing the display:
+	 *   - drop rows for files deleted from disk since they were scanned, so a
+	 *     stale hashfile does not grow and the dedupe phase does not load
+	 *     phantom groups (must precede the count and the per-pass loads);
+	 *   - build the find-dupes indexes (deferred from the scan so it is not
+	 *     maintained per row). Best-effort: the lookups are correct without
+	 *     them, so a failure here (e.g. a read-only hashfile) must not abort;
+	 *   - estimate the dup-group total so the bar and ETA have a scale.
 	 */
+	if (options.run_dedupe)
+		pdedupe_begin(0, passes);
+
+	if (options.run_dedupe)
+		pdedupe_set_activity("checking for deleted files");
+	{
+		int64_t pruned = filescan_prune_deleted(db);
+
+		if (pruned > 0)
+			gap_status("Pruned %lld deleted file%s from the hashfile\n",
+				   (long long)pruned, pruned == 1 ? "" : "s");
+	}
+
+	if (options.run_dedupe)
+		pdedupe_set_activity("building search indexes");
 	(void)dbfile_create_search_indexes(db);
 
-	/* Spawn a dedicated thread pool to block-based lookup */
+	/* Spawn a dedicated thread pool for block-based lookup */
 	if (options.do_block_hash)
 		extents_search_init();
 
-	/* One status area + one summary spanning every batch below. Estimate
-	 * the total dup-group count first so the progress and ETA have a
-	 * scale. */
 	if (options.run_dedupe) {
 		unsigned long long total;
 
-		/*
-		 * Start the dedupe live block first (group count not known yet),
-		 * then run the count - which can take a moment on a big hashfile -
-		 * with the dedupe stage spinning and "analyzing duplicates" showing
-		 * on the status line under the bar, instead of a stale line above.
-		 */
-		pdedupe_begin(0, passes);
+		pdedupe_set_activity("analyzing duplicates");
 		total = dbfile_count_dupe_groups(db, options.only_whole_files);
 		pdedupe_set_estimate(total);
 	}
@@ -1233,14 +1244,10 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		return ret;
 
 	/*
-	 * The bulk insert is done; build the find-dupes indexes now (deferred
-	 * from open so scanning does not maintain them per row).
-	 */
-	ret = dbfile_create_search_indexes(db);
-	if (ret)
-		return ret;
-
-	/*
+	 * Note: the find-dupes indexes are built later, in process_duplicates(),
+	 * so the (deferred, potentially slow) build happens under the live dedupe
+	 * block rather than during a frozen gap after hashing.
+	 *
 	 * Sync the locked filesystem informations in the hashfile
 	 */
 	fs_get_locked_uuid(&(dbfile_cfg.fs_uuid));
@@ -1527,24 +1534,14 @@ int main(int argc, char **argv)
 	if (!replaying && !stdin_filelist && options.hashfile)
 		persist_scan_config(db, roots, numfiles);
 
-	/*
-	 * Drop rows for files deleted from disk since they were scanned,
-	 * so a stale hashfile does not keep growing and does not make the
-	 * dedupe phase load phantom groups. Before process_duplicates()
-	 * so it works on the pruned set.
-	 */
-	{
-		int64_t pruned = filescan_prune_deleted(db);
-
-		if (pruned > 0)
-			gap_status("Pruned %lld deleted file%s from the "
-				"hashfile\n", (long long)pruned,
-				pruned == 1 ? "" : "s");
-	}
-
 	if (options.hashfile)
 		gap_status("Hashfile \"%s\" written\n", options.hashfile);
 
+	/*
+	 * process_duplicates() does the post-scan prep (prune deleted files,
+	 * build the find-dupes indexes, count groups) under the live dedupe
+	 * block, so those seconds animate instead of freezing the display.
+	 */
 	process_duplicates(db);
 
 	/* Append this run to the hashfile's history (fuels --history / --json). */
