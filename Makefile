@@ -13,6 +13,8 @@ CFILES = $(filter-out tests.c,$(sort $(wildcard *.c)))
 DEPENDS := $(CFILES:.c=.d)
 OBJECTS := $(CFILES:.c=.o)
 install_progs = duperemove hashstats btrfs-extent-same
+# Shipped helper scripts (not build targets) that also belong in $(BINDIR).
+install_scripts = show-shared-extents
 progs = $(install_progs) csum-test
 PROGS_OBJECTS := $(addsuffix .o,$(basename $(progs)))
 SHARED_OBJECTS := $(filter-out $(PROGS_OBJECTS),$(OBJECTS))
@@ -70,7 +72,7 @@ test:
 
 install: $(install_progs) $(MANPAGES) $(ZSH_COMPLETION)
 	mkdir -p -m 0755 $(DESTDIR)$(BINDIR)
-	for prog in $(install_progs); do \
+	for prog in $(install_progs) $(install_scripts); do \
 		install -m 0755 $$prog $(DESTDIR)$(BINDIR); \
 	done
 	mkdir -p -m 0755 $(DESTDIR)$(MANDIR)/man8
@@ -83,7 +85,7 @@ install: $(install_progs) $(MANPAGES) $(ZSH_COMPLETION)
 	done
 
 uninstall:
-	for prog in $(install_progs); do \
+	for prog in $(install_progs) $(install_scripts); do \
 		rm -f $(DESTDIR)$(BINDIR)/$$prog; \
 	done
 	for man in $(MANPAGES); do \
