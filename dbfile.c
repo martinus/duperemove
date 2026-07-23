@@ -254,6 +254,19 @@ static int dbfile_set_modes(sqlite3 *db)
 		return ret;
 	}
 
+	/*
+	 * Wait out transient lock contention instead of failing immediately.
+	 * The hashfile is touched by several connections (the listing reader
+	 * and the per-worker writers); without a timeout a brief overlap - e.g.
+	 * a WAL checkpoint racing a write - surfaces as "database is locked"
+	 * (SQLITE_BUSY). 30s comfortably covers any single transaction.
+	 */
+	ret = sqlite3_exec(db, "PRAGMA busy_timeout = 30000", NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret, "setting busy timeout");
+		return ret;
+	}
+
 	return ret;
 }
 
