@@ -513,7 +513,7 @@ static unsigned int print_bar_line(void)
 	if (!indet) {
 		printf("  %s%u%%%s", col_bold, pct, col_reset);
 		if (eta > 0.0)
-			printf("  %s·%s ETA ~%s", col_dim, col_reset,
+			printf(" %s·%s ETA ~%s", col_dim, col_reset,
 			       human_duration(eta));
 	}
 	putchar('\n');
