@@ -476,8 +476,9 @@ static int dbfile_set_modes(sqlite3 *db)
  */
 static bool hashfile_rebuilt;
 
-static int dbfile_prepare(sqlite3 *db, bool readonly)
+static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 {
+	sqlite3 *db = *db_p;
 	struct dbfile_config cfg;
 	int ret;
 	char dbpath[PATH_MAX + 1];
@@ -548,8 +549,18 @@ static int dbfile_prepare(sqlite3 *db, bool readonly)
 			return ret;
 		}
 
+		/*
+		 * Hand the freshly-opened handle back to the caller: dbfile_prepare
+		 * took *db_p by reference precisely so this replacement propagates.
+		 * The old handle was just closed above; returning it (as the by-value
+		 * version did) left the caller using freed memory and leaking this new
+		 * one.
+		 */
 		db = __dbfile_open_handle(dbpath, false, false);
-		return dbfile_prepare(db, false);
+		*db_p = db;
+		if (!db)
+			return -1;
+		return dbfile_prepare(db_p, false);
 	}
 
 	/* May store the default config, if fields were missing
@@ -603,7 +614,7 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 		return NULL;
 	}
 
-	ret = dbfile_prepare(db, readonly);
+	ret = dbfile_prepare(&db, readonly);
 	if (ret) {
 		sqlite3_close(db);
 		return NULL;
