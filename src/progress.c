@@ -62,6 +62,19 @@ bool tty;
 unsigned int w_col;
 
 /*
+ * When set (--progress=json), the progress thread streams newline-delimited
+ * JSON to stderr once a second instead of drawing the ANSI block, and all the
+ * cursor/screen handling is skipped. Works whether or not stdout is a tty, so
+ * scheduled / non-interactive runs can be monitored. stdout is untouched.
+ */
+static bool progress_json;
+
+void progress_set_json(bool on)
+{
+	progress_json = on;
+}
+
+/*
  * Rows the live progress block occupied in the last render. The redraw returns
  * to the top of the block by moving the cursor up this many rows (a *relative*
  * move, which stays correct when the terminal scrolls) rather than restoring an
@@ -137,6 +150,18 @@ static double scan_eta_seconds(uint64_t done_bytes, uint64_t done_files,
 	if (total <= done)
 		return 0.0;
 	return elapsed * (total - done) / done;
+}
+
+/*
+ * Dedupe ETA: linear extrapolation from the rate so far, once enough groups are
+ * done for it to be stable. -1 until measurable. Shared by the live bar and the
+ * JSON stream so they never diverge.
+ */
+static double dedupe_eta_seconds(uint64_t done, uint64_t total, double elapsed)
+{
+	if (done > 20 && elapsed > 2.0 && done < total)
+		return (double)(total - done) / (done / elapsed);
+	return -1.0;
 }
 
 /*
@@ -496,8 +521,7 @@ static unsigned int print_bar_line(void)
 			/* No group count yet (still analyzing): bounce the bar. */
 			indet = true;
 		}
-		if (done > 20 && elapsed > 2.0 && done < total)
-			eta = (total - done) / (done / elapsed);
+		eta = dedupe_eta_seconds(done, total, elapsed);
 	} else if (!pscan.listing_completed) {
 		/* Hashing total not known until the listing finishes. */
 		indet = true;
@@ -640,12 +664,21 @@ static void prepare_screen_area(void)
 	drawn_lines = 0;
 }
 
+/* Refresh the per-run scanned totals from the live slots. Caller holds mutex. */
+static void sum_scanned(void)
+{
+	files_scanned = bytes_scanned = 0;
+	for (unsigned int i = 0; i < pscan.thread_count; i++) {
+		files_scanned += pscan.threads[i]->total_scanned_files;
+		bytes_scanned += pscan.threads[i]->total_scanned_bytes;
+	}
+}
+
 static void *print_progress(void)
 {
 	unsigned int lines = 0;
 
-	files_scanned = 0;
-	bytes_scanned = 0;
+	sum_scanned();
 
 	progress_home();	/* back to the top of the block we drew last time */
 
@@ -653,8 +686,6 @@ static void *print_progress(void)
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
 		print_thread_progress(pscan.threads[i], i + 1);
 		lines++;
-		files_scanned += pscan.threads[i]->total_scanned_files;
-		bytes_scanned += pscan.threads[i]->total_scanned_bytes;
 	}
 
 	/* One blank spacer line between the workers and the stage indicator. */
@@ -669,10 +700,117 @@ static void *print_progress(void)
 	return NULL;
 }
 
+/* The live edge for the JSON stream: scanning and hashing overlap, so the
+ * hashing tick begins once the listing is complete; dedupe once it starts. */
+enum jphase { JP_SCAN, JP_HASH, JP_DEDUPE };
+
+static enum jphase json_phase(void)
+{
+	return pdd.phase ? JP_DEDUPE :
+	       (pscan.listing_completed ? JP_HASH : JP_SCAN);
+}
+
+/*
+ * One newline-delimited JSON progress object on stderr for the given phase.
+ * Numbers are raw (bytes, file/group counts); *_sec fields are seconds. Fields
+ * that are not yet measurable (ETA, rate) are simply omitted. Consumers read a
+ * line at a time and can ignore any line that is not valid JSON (e.g. an
+ * interleaved error). files_scanned/bytes_scanned are the per-run sums the
+ * caller refreshed this tick. See docs/man/oans.md.
+ */
+static void emit_json_progress(enum jphase phase)
+{
+	double elapsed = elapsed_seconds();
+
+	switch (phase) {
+	case JP_DEDUPE: {
+		uint64_t done = pdd.done, queued = pdd.queued;
+		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
+		uint64_t st = search_total, sd = search_processed;
+		double de = (g_get_monotonic_time() - pdd.start_us) / 1e6;
+		double eta = dedupe_eta_seconds(done, total, de);
+
+		fprintf(stderr, "{\"phase\":\"dedupe\",\"elapsed_sec\":%.2f,"
+			"\"groups\":%" PRIu64 ",\"groups_total\":%" PRIu64 ","
+			"\"reclaimed_bytes\":%" PRIu64, elapsed, done, total,
+			(uint64_t)pdd.reclaimed);
+		if (pdd.activity)
+			fprintf(stderr, ",\"activity\":\"%s\"", pdd.activity);
+		if (st)
+			fprintf(stderr, ",\"search_files\":%" PRIu64 ","
+				"\"search_files_total\":%" PRIu64, sd, st);
+		if (eta > 0.0)
+			fprintf(stderr, ",\"eta_sec\":%.1f", eta);
+		break;
+	}
+	case JP_SCAN:
+		fprintf(stderr, "{\"phase\":\"scanning\",\"elapsed_sec\":%.2f,"
+			"\"files_examined\":%" PRIu64 ",\"files_to_hash\":%" PRIu64,
+			elapsed, pscan.files_examined, pscan.total_files_count);
+		break;
+	case JP_HASH: {
+		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
+
+		fprintf(stderr, "{\"phase\":\"hashing\",\"elapsed_sec\":%.2f,"
+			"\"files\":%" PRIu64 ",\"files_total\":%" PRIu64 ","
+			"\"bytes\":%" PRIu64 ",\"bytes_total\":%" PRIu64,
+			elapsed, files_scanned, tf, bytes_scanned, tb);
+		if (bytes_scanned && elapsed > 1.0) {
+			double eta = scan_eta_seconds(bytes_scanned, files_scanned,
+						      tb, tf, eta_file_weight, elapsed);
+
+			fprintf(stderr, ",\"bytes_per_sec\":%.0f",
+				bytes_scanned / elapsed);
+			if (eta > 0.0)
+				fprintf(stderr, ",\"eta_sec\":%.1f", eta);
+		}
+		break;
+	}
+	}
+	fprintf(stderr, "}\n");
+	fflush(stderr);
+}
+
+/* Emitted once at the end of a run when --progress=json is set. */
+void pscan_json_done(uint64_t files_scanned, uint64_t groups, uint64_t reclaimed)
+{
+	if (!progress_json)
+		return;
+	fprintf(stderr, "{\"event\":\"done\",\"elapsed_sec\":%.2f,"
+		"\"files_scanned\":%" PRIu64 ",\"groups_deduped\":%" PRIu64 ","
+		"\"reclaimed_bytes\":%" PRIu64 "}\n",
+		elapsed_seconds(), files_scanned, groups, reclaimed);
+	fflush(stderr);
+}
+
 static void *pscan_progress_thread(void * p)
 {
 	struct winsize w;
+	gint64 json_last = 0;	/* monotonic us of the last JSON emit */
+	enum jphase json_last_phase = -1;
+
 	do {
+		if (progress_json) {
+			gint64 now = g_get_monotonic_time();
+			enum jphase phase = json_phase();
+
+			/* Refresh the per-run sums every tick so the loop's exit test
+			 * stays responsive (~100ms). Emit ~1/s, but always right away
+			 * on a phase change so every phase is reported even on a fast
+			 * run. */
+			g_mutex_lock(&pscan.mutex);
+			sum_scanned();
+			g_mutex_unlock(&pscan.mutex);
+
+			if (phase != json_last_phase || now - json_last >= 1000000) {
+				emit_json_progress(phase);
+				json_last = now;
+				json_last_phase = phase;
+			}
+			usleep(100 * 1000);
+			continue;
+		}
+
 		/* Refresh the tty properties. Some ttys (e.g. bare ptys)
 		 * report a zero width; treat that as "don't truncate". */
 		if (tty) {
@@ -733,7 +871,7 @@ void pscan_run(void)
 	spin_frame = 0;
 	pscan.files_examined = 0;	/* cumulative walk count, climbs to the total */
 
-	if (tty) {
+	if (tty && !progress_json) {
 		/* hide the cursor */
 		printf("\33[?25l");
 
@@ -751,6 +889,13 @@ void pscan_join(bool continues)
 
 	/* The listing is done (STAGE_SCAN) and the csum pool has drained. */
 	stage_set(STAGE_HASH, ST_DONE);
+
+	/* JSON mode draws no block: nothing to leave or wipe, just release the
+	 * scan slots (the dedupe phase re-claims its own). */
+	if (progress_json) {
+		pscan_free_threads();
+		return;
+	}
 
 	if (continues) {
 		/*
@@ -845,6 +990,14 @@ void pscan_printf(char *fmt, ...)
 	va_list args;
 	va_start(args, fmt);
 
+	/* JSON mode draws no block (and the progress stream is on stderr), so a
+	 * routed message is just a plain stdout print. */
+	if (progress_json) {
+		vfprintf(stdout, fmt, args);
+		va_end(args);
+		return;
+	}
+
 	g_mutex_lock(&pscan.mutex);
 
 	/* Erase the live block, print the message where it sat (it becomes
@@ -912,21 +1065,24 @@ void pdedupe_begin(unsigned int batches)
 	spin_frame = 0;
 
 	/*
-	 * The live area only makes sense on a tty; under -v the per-group
-	 * notices would fight with the redraws, and -q wants silence. The
-	 * counters above accumulate regardless, for the final summary.
+	 * JSON progress runs regardless of tty/-q/-v (it draws no block). The
+	 * interactive block only makes sense on a tty; under -v the per-group
+	 * notices would fight the redraws, and -q wants silence. The counters
+	 * above accumulate regardless, for the final summary.
 	 */
-	if (quiet || verbose || !isatty(STDOUT_FILENO))
+	if (!progress_json && (quiet || verbose || !isatty(STDOUT_FILENO)))
 		return;
 
-	tty = true;
-	printf("\33[?25l");	/* hide the cursor (a no-op if scan already did) */
-	/*
-	 * Do NOT reset drawn_lines here: the scan left its block in place (see
-	 * pscan_join with continues=true), so the first dedupe render redraws
-	 * over that same block, keeping the worker list continuous. When there
-	 * was no scan block (drawn_lines already 0) this simply draws fresh.
-	 */
+	if (!progress_json) {
+		tty = true;
+		printf("\33[?25l");	/* hide the cursor (a no-op if scan already did) */
+		/*
+		 * Do NOT reset drawn_lines here: the scan left its block in place
+		 * (see pscan_join with continues=true), so the first dedupe render
+		 * redraws over that same block, keeping the worker list continuous.
+		 * When there was no scan block (drawn_lines already 0) it draws fresh.
+		 */
+	}
 	pdd.running = 1;
 	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
 }
@@ -944,13 +1100,15 @@ void pdedupe_end(void)
 
 		/* Show the cursor again, wipe the live block, and leave the
 		 * fully-ticked stage line in place; the caller prints the final
-		 * summary below it. */
-		printf("\33[?25h");
-		progress_home();
-		progress_wipe();
-		drawn_lines = 0;
-		print_stage_line();
-		fflush(stdout);
+		 * summary below it. (JSON mode drew no block.) */
+		if (!progress_json) {
+			printf("\33[?25h");
+			progress_home();
+			progress_wipe();
+			drawn_lines = 0;
+			print_stage_line();
+			fflush(stdout);
+		}
 	}
 	pscan_free_threads();
 	pdd.phase = false;

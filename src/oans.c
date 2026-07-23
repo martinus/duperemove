@@ -626,6 +626,7 @@ enum {
 	HISTORY_OPTION,
 	JSON_OPTION,
 	AUTOTUNE_OPTION,
+	PROGRESS_OPTION,
 };
 
 static int add_one_stdin_file(char *path, void *db)
@@ -709,6 +710,7 @@ static void help(void)
 "Other:\n"
 "  -q, --quiet                 print only errors and a one-line summary\n"
 "  -v                          verbose output\n"
+"      --progress=json         stream machine-readable progress (JSONL) to stderr\n"
 "      --no-color              disable colored output\n"
 "      --debug                 print debug messages (implies -v)\n"
 "      --version               print version and exit\n"
@@ -743,6 +745,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "history", 0, NULL, HISTORY_OPTION },
 		{ "json", 0, NULL, JSON_OPTION },
 		{ "autotune", 0, NULL, AUTOTUNE_OPTION },
+		{ "progress", 1, NULL, PROGRESS_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -825,6 +828,14 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case AUTOTUNE_OPTION:
 			autotune_opt = 1;
+			break;
+		case PROGRESS_OPTION:
+			if (strcmp(optarg, "json") != 0) {
+				eprintf("Error: --progress only supports 'json', "
+					"'%s' found\n", optarg);
+				return EINVAL;
+			}
+			options.progress_json = true;
 			break;
 		case QUIET_OPTION:
 		case 'q':
@@ -1168,10 +1179,14 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		      uint64_t *files_scanned)
 {
 	int ret;
+	/* Run the progress thread whenever there's an output to feed - the live
+	 * display (unless -q) or the JSON stream. The run/join calls must gate on
+	 * the same thing, so decide once. */
+	bool want_progress = !quiet || options.progress_json;
 
 	filescan_init();
 	filescan_walk_begin();
-	if (!quiet)
+	if (want_progress)
 		pscan_run();
 
 	/* Seed the walk with the roots (this only queues them). */
@@ -1199,14 +1214,15 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 
 	pscan_finish_listing();
 	filescan_free();
-	if (!quiet) {
+	if (want_progress) {
 		/*
 		 * A live dedupe phase (the only one that keeps drawing the block)
 		 * runs when deduping on an interactive, non-verbose tty. Tell the
-		 * scan to leave its worker block in place for it; otherwise the
-		 * area is wiped clean.
+		 * scan to leave its worker block in place for it; otherwise (incl.
+		 * JSON mode) the area is wiped clean.
 		 */
 		bool dedupe_live = options.run_dedupe && !verbose &&
+				   !options.progress_json &&
 				   isatty(STDOUT_FILENO);
 
 		pscan_join(dedupe_live);
@@ -1405,6 +1421,7 @@ int main(int argc, char **argv)
 	}
 
 	color_init(opt_no_color);
+	progress_set_json(options.progress_json);
 	start_timer();
 
 	/* Allow larger than unusal amount of open files. On linux
@@ -1522,21 +1539,27 @@ int main(int argc, char **argv)
 	 */
 	process_duplicates(db);
 
-	/* Append this run to the hashfile's history (fuels --history / --json). */
-	if (options.hashfile) {
+	{
 		uint64_t groups = 0, reclaimed = 0;
-		struct run_record rec;
 
 		pdedupe_counters(&groups, &reclaimed, NULL);
-		rec = (struct run_record){
-			.ts = time(NULL),
-			.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
-			.files_scanned = files_scanned,
-			.reclaimed = reclaimed,
-			.groups = groups,
-			.deduped = options.run_dedupe,
-		};
-		dbfile_record_run(db, &rec);
+
+		/* Terminal event for --progress=json (a no-op otherwise); before the
+		 * hashfile-only history record so in-memory runs report it too. */
+		pscan_json_done(files_scanned, groups, reclaimed);
+
+		/* Append this run to the hashfile's history (fuels --history/--json). */
+		if (options.hashfile) {
+			struct run_record rec = {
+				.ts = time(NULL),
+				.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
+				.files_scanned = files_scanned,
+				.reclaimed = reclaimed,
+				.groups = groups,
+				.deduped = options.run_dedupe,
+			};
+			dbfile_record_run(db, &rec);
+		}
 	}
 
 	/* Reclaim space if a prune this run left the hashfile mostly free. */
