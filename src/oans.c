@@ -25,7 +25,6 @@
 #include <errno.h>
 #include <string.h>
 #include <getopt.h>
-#include <stdarg.h>
 #include <inttypes.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -68,27 +67,6 @@ static int opt_no_color = 0;
 static char **user_excludes;
 static int n_user_excludes;
 struct dbfile_config dbfile_cfg;
-
-/*
- * A status message emitted between the scan and dedupe phases. When the live
- * worker block is on screen (interactive dedupe) it must be routed through
- * pscan_printf() so it lands above the block instead of corrupting the
- * relative redraw; otherwise it is a plain (quiet-respecting) print.
- */
-static void gap_status(const char *fmt, ...)
-{
-	char buf[512];
-	va_list ap;
-
-	va_start(ap, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
-
-	if (pscan_live_block())
-		pscan_printf("%s", buf);
-	else if (!quiet)
-		fputs(buf, stdout);
-}
 
 static void print_file(char *filename, char *ino, char *subvol)
 {
@@ -1060,9 +1038,10 @@ static void process_duplicates(struct dbhandle *db)
 	passes = max > first_seq ? (max - first_seq + stride - 1) / stride : 0;
 
 	/*
-	 * Deferred post-scan prep, run under the live dedupe block (started just
-	 * below) so the seconds it can take on a big hashfile animate instead of
-	 * freezing the display:
+	 * Start the live dedupe block first, then do the deferred post-scan prep
+	 * under it so the seconds it can take on a big hashfile animate instead of
+	 * freezing the display. With the printer running, qprintf() routes these
+	 * status lines above the block (see progress_print). The prep:
 	 *   - drop rows for files deleted from disk since they were scanned, so a
 	 *     stale hashfile does not grow and the dedupe phase does not load
 	 *     phantom groups (must precede the count and the per-pass loads);
@@ -1070,22 +1049,24 @@ static void process_duplicates(struct dbhandle *db)
 	 *     maintained per row). Best-effort: the lookups are correct without
 	 *     them, so a failure here (e.g. a read-only hashfile) must not abort;
 	 *   - estimate the dup-group total so the bar and ETA have a scale.
+	 * The pdedupe_set_activity() calls are harmless no-ops without a live block.
 	 */
 	if (options.run_dedupe)
-		pdedupe_begin(0, passes);
+		pdedupe_begin(passes);
 
-	if (options.run_dedupe)
-		pdedupe_set_activity("checking for deleted files");
+	if (options.hashfile)
+		qprintf("Hashfile \"%s\" written\n", options.hashfile);
+
+	pdedupe_set_activity("checking for deleted files");
 	{
 		int64_t pruned = filescan_prune_deleted(db);
 
 		if (pruned > 0)
-			gap_status("Pruned %lld deleted file%s from the hashfile\n",
-				   (long long)pruned, pruned == 1 ? "" : "s");
+			qprintf("Pruned %lld deleted file%s from the hashfile\n",
+				(long long)pruned, pruned == 1 ? "" : "s");
 	}
 
-	if (options.run_dedupe)
-		pdedupe_set_activity("building search indexes");
+	pdedupe_set_activity("building search indexes");
 	(void)dbfile_create_search_indexes(db);
 
 	/* Spawn a dedicated thread pool for block-based lookup */
@@ -1533,9 +1514,6 @@ int main(int argc, char **argv)
 	/* Remember this run so a later bare `oans --hashfile=X` replays it. */
 	if (!replaying && !stdin_filelist && options.hashfile)
 		persist_scan_config(db, roots, numfiles);
-
-	if (options.hashfile)
-		gap_status("Hashfile \"%s\" written\n", options.hashfile);
 
 	/*
 	 * process_duplicates() does the post-scan prep (prune deleted files,

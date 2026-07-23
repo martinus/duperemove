@@ -274,6 +274,14 @@ static const char *const BAR_SUB[] = {
 #define BAR_WIDTH	40
 #define STAGE_PREFIX_W	8	/* widest stage name ("scanning") */
 #define STATUS_COL_W	9	/* widest worker status ("wait lock") */
+/* Worker-line left column: number(3) + gap(2) + status + gap(2) before the path. */
+#define WORKER_LEFT_W	(3 + 2 + STATUS_COL_W + 2)
+
+/* The dim " · " separator between fields on the bar and detail lines. */
+static void detail_sep(void)
+{
+	printf(" %s·%s ", col_dim, col_reset);
+}
 
 /* Worker status word (no colon) and its color. thread_scanning is "hashing". */
 static const char *status_word(enum pscan_thread_status s)
@@ -359,7 +367,7 @@ static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 	 * budget is computed from the plain metrics only.
 	 */
 	termw = (int)(w_col == UINT_MAX ? 80 : w_col);
-	avail = termw - (3 + 2 + STATUS_COL_W + 2) - (int)strlen(m_plain) - 2;
+	avail = termw - WORKER_LEFT_W - (int)strlen(m_plain) - 2;	/* -2: gap before metrics */
 	/* Never emit raw control bytes from a filename to the terminal (#353). */
 	sanitize_ctrl(t->file_path, clean, sizeof(clean));
 	ellipsize_path(clean, path, sizeof(path), avail);
@@ -506,15 +514,14 @@ static unsigned int print_bar_line(void)
 				       eta_file_weight, elapsed);
 	}
 
-	if (tty)
-		fputs("\033[K", stdout);
-	printf("%s%-*s%s  ", acc, STAGE_PREFIX_W, stage_name[cs], col_reset);
+	s_printf("%s%-*s%s  ", acc, STAGE_PREFIX_W, stage_name[cs], col_reset);
 	render_bar(frac, indet, acc);
 	if (!indet) {
 		printf("  %s%u%%%s", col_bold, pct, col_reset);
-		if (eta > 0.0)
-			printf(" %s·%s ETA ~%s", col_dim, col_reset,
-			       human_duration(eta));
+		if (eta > 0.0) {
+			detail_sep();
+			printf("ETA ~%s", human_duration(eta));
+		}
 	}
 	putchar('\n');
 	return 1;
@@ -527,9 +534,7 @@ static unsigned int print_bar_line(void)
  */
 static unsigned int print_detail_line(void)
 {
-	if (tty)
-		fputs("\033[K", stdout);
-	printf("%*s", STAGE_PREFIX_W + 2, "");
+	s_printf("%*s", STAGE_PREFIX_W + 2, "");
 
 	if (pdd.phase) {
 		uint64_t done = pdd.done, queued = pdd.queued;
@@ -556,25 +561,30 @@ static unsigned int print_detail_line(void)
 		 */
 		if (done == 0 && pdd.activity) {
 			printf("%s", pdd.activity);
-			if (st)
-				printf(" %s·%s %s/%s files", col_dim, col_reset,
-				       group_u64(sd), group_u64(st));
+			if (st) {
+				detail_sep();
+				printf("%s/%s files", group_u64(sd), group_u64(st));
+			}
 			putchar('\n');
 			return 1;
 		}
 
 		printf("%s%s%s / ~%s groups",
 		       col_bold, group_u64(done), col_reset, group_u64(total));
-		if (pdd.batches > 1)
-			printf(" %s·%s batch %u/%u", col_dim, col_reset,
-			       pdd.batch, pdd.batches);
-		if (st)
-			printf(" %s·%s searching extents %s/%s",
-			       col_dim, col_reset, group_u64(sd), group_u64(st));
-		else if (pool_idle && pdd.activity)
-			printf(" %s·%s %s", col_dim, col_reset, pdd.activity);
-		printf(" %s·%s reclaimed %s%s%s\n", col_dim, col_reset,
-		       col_green, human_size(pdd.reclaimed), col_reset);
+		if (pdd.batches > 1) {
+			detail_sep();
+			printf("batch %u/%u", pdd.batch, pdd.batches);
+		}
+		if (st) {
+			detail_sep();
+			printf("searching extents %s/%s", group_u64(sd), group_u64(st));
+		} else if (pool_idle && pdd.activity) {
+			detail_sep();
+			printf("%s", pdd.activity);
+		}
+		detail_sep();
+		printf("reclaimed %s%s%s\n", col_green,
+		       human_size(pdd.reclaimed), col_reset);
 		return 1;
 	}
 
@@ -584,10 +594,11 @@ static unsigned int print_detail_line(void)
 		 * visited (reset once at pscan_run); total_files_count is how many
 		 * of them need (re)hashing. Both climb monotonically during listing.
 		 */
-		printf("%s%s%s files %s·%s %s%s%s need hashing\n",
-		       col_bold, group_u64(pscan.files_examined), col_reset,
-		       col_dim, col_reset,
-		       col_bold, group_u64(pscan.total_files_count), col_reset);
+		printf("%s%s%s files", col_bold,
+		       group_u64(pscan.files_examined), col_reset);
+		detail_sep();
+		printf("%s%s%s need hashing\n", col_bold,
+		       group_u64(pscan.total_files_count), col_reset);
 		return 1;
 	}
 
@@ -595,13 +606,14 @@ static unsigned int print_detail_line(void)
 		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
 		double elapsed = elapsed_seconds();
 
-		printf("%s%s%s / %s files %s·%s %s / %s",
-		       col_bold, group_u64(files_scanned), col_reset, group_u64(tf),
-		       col_dim, col_reset, human_size(bytes_scanned),
-		       human_size(tb));
-		if (bytes_scanned && elapsed > 1.0)
-			printf(" %s·%s %s/s", col_dim, col_reset,
-			       human_size((uint64_t)(bytes_scanned / elapsed)));
+		printf("%s%s%s / %s files", col_bold,
+		       group_u64(files_scanned), col_reset, group_u64(tf));
+		detail_sep();
+		printf("%s / %s", human_size(bytes_scanned), human_size(tb));
+		if (bytes_scanned && elapsed > 1.0) {
+			detail_sep();
+			printf("%s/s", human_size((uint64_t)(bytes_scanned / elapsed)));
+		}
 		putchar('\n');
 		return 1;
 	}
@@ -768,11 +780,6 @@ void pscan_join(bool continues)
 	pscan_free_threads();
 }
 
-bool pscan_live_block(void)
-{
-	return tty && drawn_lines > 0;
-}
-
 void pscan_reset_thread(struct pscan_thread **progress)
 {
 	/*
@@ -884,13 +891,13 @@ struct pscan_thread *pscan_claim_slot(pid_t tid,
 	return slot;
 }
 
-void pdedupe_begin(uint64_t estimated_groups, unsigned int batches)
+void pdedupe_begin(unsigned int batches)
 {
 	pdd.done = 0;
 	pdd.queued = 0;
 	pdd.reclaimed = 0;
 	pdd.net_shared = 0;
-	pdd.estimate = estimated_groups;
+	pdd.estimate = 0;		/* set later via pdedupe_set_estimate() */
 	pdd.batches = batches;
 	pdd.batch = batches ? 1 : 0;
 	pdd.activity = "analyzing duplicates";

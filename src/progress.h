@@ -82,14 +82,6 @@ void pscan_run(void);
 void pscan_join(bool continues);
 
 /*
- * True when an in-place live block is currently on screen (a tty with a drawn
- * block). Between the scan and dedupe phases, callers route their status
- * messages through pscan_printf() when this is true so the message lands above
- * the block instead of corrupting the relative redraw.
- */
-bool pscan_live_block(void);
-
-/*
  * Per-work-item reset for the churning dedupe pool: finish the current file's
  * accounting (total_scanned_files++, total_scanned_bytes fed up to the file
  * size in case it shrank) and park the slot idle. Equivalent to
@@ -126,7 +118,7 @@ void pscan_printf(char *fmt, ...);
  * dbfile_count_dupe_groups()), and a bar pinned at 100% while work continues
  * is worse than one that finishes from 99%.
  */
-void pdedupe_begin(uint64_t estimated_groups, unsigned int batches);
+void pdedupe_begin(unsigned int batches);
 void pdedupe_end(void);
 
 /*
