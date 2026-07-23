@@ -84,8 +84,8 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 **-r**
   ~ Recurse into subdirectories of any directory argument.
 
-<!-- The blank line below is required: without it pandoc >=3.9 collapses
-     this multi-paragraph definition into a single block. -->
+<!-- Keep the blank line between this term and its `~` body below: without it
+     pandoc >=3.9 collapses this multi-paragraph definition into a single block. -->
 **\--hashfile**=*FILE*
 
   ~ Store hashes in *FILE* (an SQLite database) instead of memory. This is the

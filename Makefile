@@ -118,10 +118,13 @@ doc:
 # Fetch a prebuilt pandoc from PyPI's pypandoc_binary wheel into .pandoc/.
 # Works where GitHub release downloads are blocked but PyPI is reachable (e.g.
 # CI sandboxes). `make doc` then picks it up automatically; nothing to install.
+# Pinned so the fetched pandoc (and thus the .8 it generates) is reproducible
+# rather than drifting to whatever is newest; this wheel carries pandoc 3.9.
+PYPANDOC_VERSION = 1.17
 .PHONY: pandoc
 pandoc:
 	@mkdir -p .pandoc
-	pip download pypandoc_binary --no-deps -d .pandoc
+	pip download pypandoc_binary==$(PYPANDOC_VERSION) --no-deps -d .pandoc
 	@cd .pandoc && unzip -o -q pypandoc_binary-*.whl && cp -f pypandoc/files/pandoc pandoc && chmod +x pandoc
 	@echo "Fetched $$(.pandoc/pandoc --version | head -1) -> .pandoc/pandoc"
 

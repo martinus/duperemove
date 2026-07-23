@@ -28,20 +28,15 @@ normal machine with the README's deps needs none of it.
 - **`make doc`** regenerates the man page from `docs/man/oans.md` and needs
   `pandoc` (on `PATH` via `devenv.sh`). roff escapes `-` as `\-`, so grep the
   generated `.8` accordingly.
-  - **No pandoc? `make pandoc`** fetches a prebuilt one into `.pandoc/` from
-    PyPI's `pypandoc_binary` wheel (`pip download pypandoc_binary`) — the way to
-    get pandoc where GitHub release downloads are blocked but PyPI is reachable
-    (CI sandboxes, this web env). `make doc` then picks `.pandoc/pandoc` up
-    automatically. It's a *newer* pandoc (3.9) than last generated the committed
-    `.8`, so a full `make doc` reformats the whole file (font macros, `\(em`,
-    rewraps) — expected, not a bug; commit it or regenerate under your usual
-    pandoc.
-  - **Multi-paragraph def-list gotcha:** pandoc ≥3.9 drops the `.PP` between
-    continuation paragraphs of a *tight* definition-list item, collapsing e.g.
-    the `--hashfile` block into one blob. Fix is in the markdown: a blank line
-    between the term and its `~` body makes the item *loose* and restores the
-    breaks (byte-identical under older pandoc). Keep the `<!-- -->` note that
-    guards it; if you add another multi-paragraph option, do the same.
+  - **No pandoc? `make pandoc`** fetches a pinned prebuilt one into `.pandoc/`
+    from PyPI (`pypandoc_binary`) — for sandboxes where GitHub is blocked but
+    PyPI works; `make doc` picks it up. It's the sandbox counterpart to devenv's
+    `OANS_PANDOC_BIN`. That pandoc (3.9) is newer than the committed `.8`'s, so a
+    full `make doc` reformats the whole file — expected, not a bug.
+  - **Multi-paragraph def-list gotcha:** pandoc ≥3.9 collapses *tight* def-list
+    items (e.g. `--hashfile`) into one blob; a blank line after the term makes it
+    *loose* and restores the breaks (a no-op under older pandoc). Keep the
+    guarding `<!-- -->`; repeat for any new multi-paragraph option.
 - Confirm you're testing *this* `./oans`, not a system `duperemove`, before
   diagnosing runtime behaviour.
 
