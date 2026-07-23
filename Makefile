@@ -76,6 +76,23 @@ test:
 integration: oans
 	DUPEREMOVE=./oans python3 tests/run.py
 
+# Same end-to-end suite, but every oans invocation runs under valgrind memcheck
+# (via tests/valgrind-wrap.sh). Findings go to per-pid logs; a non-empty log
+# means a real error/leak, so we fail if any survived. ~7x slower than plain
+# `integration` - opt-in, not part of `check`. Needs valgrind installed.
+VGLOGDIR = $(CURDIR)/.vglogs
+.PHONY: integration-valgrind
+integration-valgrind: oans
+	@command -v valgrind >/dev/null 2>&1 || { echo "valgrind not installed"; exit 1; }
+	rm -rf $(VGLOGDIR) && mkdir -p $(VGLOGDIR)
+	OANS_VG_LOGDIR=$(VGLOGDIR) DUPEREMOVE=tests/valgrind-wrap.sh python3 tests/run.py
+	@if find $(VGLOGDIR) -type f -size +0c | grep -q .; then \
+		echo "=== valgrind reported errors/leaks ==="; \
+		find $(VGLOGDIR) -type f -size +0c -exec cat {} +; \
+		exit 1; \
+	fi; \
+	echo "valgrind: no findings"
+
 .PHONY: check
 check: test integration
 

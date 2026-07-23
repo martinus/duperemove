@@ -8,6 +8,7 @@ test
 *~
 *.d
 .itest-scratch/
+.vglogs/
 __pycache__/
 version
 .pandoc/
