@@ -4,10 +4,6 @@ Status: **draft for review** — no code written yet. This proposes one unified
 on-screen layout for every phase of a run so the tool looks like a single tool
 throughout, instead of the three different live displays it grows today.
 
-> Naming note: the binary is `oans`. The request referred to it as "hasta" — if
-> that's a planned rename, say so and I'll thread it through; this spec is
-> name-neutral and doesn't depend on the answer.
-
 ## 1. Motivation
 
 A run passes through several kinds of work, each of which currently draws its own
@@ -286,7 +282,6 @@ All in `src/progress.{c,h}`; call sites in `oans.c`, `find_dupes.c`,
 
 1. **Stage mapping**: Option A (monotonic, recommended), B (activity-driven
    flicker), or C (restructure)? Or drop `grouping` to a 4-word line? (§7)
-2. **"hasta"** — planned rename of `oans`, or just a working name? (title only)
-3. **Spinner/tick glyphs**: braille spinner + `✔` as specced, or do you want a
+2. **Spinner/tick glyphs**: braille spinner + `✔` as specced, or do you want a
    specific set?
-4. **Colour**: use green ticks / dim pending, or stay monochrome?
+3. **Colour**: use green ticks / dim pending, or stay monochrome?
