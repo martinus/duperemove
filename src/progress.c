@@ -557,20 +557,20 @@ static unsigned int print_detail_line(void)
 		if (done == 0 && pdd.activity) {
 			printf("%s", pdd.activity);
 			if (st)
-				printf(" %s·%s %" PRIu64 "/%" PRIu64 " files",
-				       col_dim, col_reset, sd, st);
+				printf(" %s·%s %s/%s files", col_dim, col_reset,
+				       group_u64(sd), group_u64(st));
 			putchar('\n');
 			return 1;
 		}
 
-		printf("%s%" PRIu64 "%s / ~%" PRIu64 " groups",
-		       col_bold, done, col_reset, total);
+		printf("%s%s%s / ~%s groups",
+		       col_bold, group_u64(done), col_reset, group_u64(total));
 		if (pdd.batches > 1)
 			printf(" %s·%s batch %u/%u", col_dim, col_reset,
 			       pdd.batch, pdd.batches);
 		if (st)
-			printf(" %s·%s searching extents %" PRIu64 "/%" PRIu64,
-			       col_dim, col_reset, sd, st);
+			printf(" %s·%s searching extents %s/%s",
+			       col_dim, col_reset, group_u64(sd), group_u64(st));
 		else if (pool_idle && pdd.activity)
 			printf(" %s·%s %s", col_dim, col_reset, pdd.activity);
 		printf(" %s·%s reclaimed %s%s%s\n", col_dim, col_reset,
@@ -584,10 +584,10 @@ static unsigned int print_detail_line(void)
 		 * visited (reset once at pscan_run); total_files_count is how many
 		 * of them need (re)hashing. Both climb monotonically during listing.
 		 */
-		printf("%s%" PRIu64 "%s examined %s·%s %s%" PRIu64 "%s need hashing\n",
-		       col_bold, pscan.files_examined, col_reset,
+		printf("%s%s%s examined %s·%s %s%s%s need hashing\n",
+		       col_bold, group_u64(pscan.files_examined), col_reset,
 		       col_dim, col_reset,
-		       col_bold, pscan.total_files_count, col_reset);
+		       col_bold, group_u64(pscan.total_files_count), col_reset);
 		return 1;
 	}
 
@@ -595,8 +595,8 @@ static unsigned int print_detail_line(void)
 		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
 		double elapsed = elapsed_seconds();
 
-		printf("%s%" PRIu64 "%s / %" PRIu64 " files %s·%s %s / %s",
-		       col_bold, files_scanned, col_reset, tf,
+		printf("%s%s%s / %s files %s·%s %s / %s",
+		       col_bold, group_u64(files_scanned), col_reset, group_u64(tf),
 		       col_dim, col_reset, human_size(bytes_scanned),
 		       human_size(tb));
 		if (bytes_scanned && elapsed > 1.0)

@@ -93,6 +93,25 @@ int human_duration_snprintf(double seconds, char *str, size_t str_bytes)
 	return snprintf(str, str_bytes, "%luh%02lum", s / 3600, (s % 3600) / 60);
 }
 
+/* Group digits in threes with a ',' separator: 2505166 -> "2,505,166". */
+int group_u64_snprintf(uint64_t n, char *str, size_t str_bytes)
+{
+	char tmp[21];		/* up to 20 digits for UINT64_MAX, plus NUL */
+	int len, i, out = 0;
+
+	if (str_bytes == 0)
+		return 0;
+	len = snprintf(tmp, sizeof(tmp), "%"PRIu64, n);
+	for (i = 0; i < len && (size_t)out < str_bytes - 1; i++) {
+		if (i > 0 && (len - i) % 3 == 0 && (size_t)out < str_bytes - 1)
+			str[out++] = ',';
+		if ((size_t)out < str_bytes - 1)
+			str[out++] = tmp[i];
+	}
+	str[out] = '\0';
+	return out;
+}
+
 /* Human-readable size (KiB/MiB/...); pretty_size_snprintf prints raw bytes. */
 int human_size_snprintf(uint64_t size, char *str, size_t str_bytes)
 {
