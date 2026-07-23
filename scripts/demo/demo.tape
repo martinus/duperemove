@@ -3,12 +3,13 @@
 # ./tree. VHS is the highest-quality path (real typing, window chrome, exact
 # timing). To render by hand:  cd <workdir> && vhs /path/to/demo.tape
 #
-# VHS emits the GIF; record.sh then optimizes it with gifsicle (a quality-neutral
-# ~30% shrink — the smallest inline asset for terminal casts).
+# VHS emits the GIF; record.sh then optimizes it with gifsicle (quantize to a
+# 32-colour palette + lossy — a large, quality-neutral shrink for flat terminal
+# colours).
 Output demo.gif
 
 Set Shell bash
-Set FontFamily "Hack"
+Set FontFamily "IosevkaTerm Nerd Font"
 Set FontSize 20
 Set Width 1280
 Set Height 760
@@ -17,7 +18,7 @@ Set Theme "Dracula"
 Set WindowBar Colorful
 Set BorderRadius 10
 Set TypingSpeed 55ms
-Set Framerate 12   # terminal casts read fine at 12fps and it roughly halves the GIF
+Set Framerate 10   # matches oans's ~10Hz progress redraw (every distinct state, no waste)
 
 # Put oans on PATH (exposed by record.sh) without filming the plumbing.
 Hide

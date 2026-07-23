@@ -73,10 +73,13 @@ struct pscan_thread *pscan_register_thread(pid_t tid);
 void pscan_run(void);
 
 /*
- * Wait for the progress thread to finish
- * Also cleanup per-thread progresses and print the global totals
+ * Wait for the scan progress thread to finish. When `continues` is true a live
+ * dedupe phase will keep drawing the same on-screen block, so the worker block
+ * is left in place (refreshed to show hashing ticked) instead of being wiped -
+ * the worker list never blinks away and nothing is stranded above the dedupe
+ * view. When false (print-only / non-tty / -v) the live area is wiped clean.
  */
-void pscan_join(void);
+void pscan_join(bool continues);
 
 /*
  * Per-work-item reset for the churning dedupe pool: finish the current file's
@@ -115,8 +118,16 @@ void pscan_printf(char *fmt, ...);
  * dbfile_count_dupe_groups()), and a bar pinned at 100% while work continues
  * is worse than one that finishes from 99%.
  */
-void pdedupe_begin(uint64_t estimated_groups, unsigned int batches);
+void pdedupe_begin(unsigned int batches);
 void pdedupe_end(void);
+
+/*
+ * Update the fuzzy group-count estimate after pdedupe_begin(). Lets the phase
+ * start (and its live block) before the potentially-slow count runs, so the
+ * count happens with the dedupe status ("analyzing duplicates") live under the
+ * bar rather than as a stale message printed beforehand.
+ */
+void pdedupe_set_estimate(uint64_t estimated_groups);
 
 /* Starting duplicate-batch cur (1-based) of the batches passed to begin. */
 void pdedupe_set_batch(unsigned int cur);

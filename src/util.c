@@ -43,6 +43,7 @@
 const char *col_reset = "", *col_bold = "", *col_dim = "";
 const char *col_red = "", *col_green = "", *col_yellow = "";
 const char *col_blue = "", *col_cyan = "";
+const char *col_magenta = "";
 
 void color_init(bool disable)
 {
@@ -51,7 +52,7 @@ void color_init(bool disable)
 
 	col_reset = "\033[0m"; col_bold = "\033[1m"; col_dim = "\033[2m";
 	col_red = "\033[31m"; col_green = "\033[32m"; col_yellow = "\033[33m";
-	col_blue = "\033[34m"; col_cyan = "\033[36m";
+	col_blue = "\033[34m"; col_cyan = "\033[36m"; col_magenta = "\033[35m";
 }
 
 static struct timespec timer_start;
@@ -90,6 +91,25 @@ int human_duration_snprintf(double seconds, char *str, size_t str_bytes)
 	if (s < 3600)
 		return snprintf(str, str_bytes, "%lum%02lus", s / 60, s % 60);
 	return snprintf(str, str_bytes, "%luh%02lum", s / 3600, (s % 3600) / 60);
+}
+
+/* Group digits in threes with a ',' separator: 2505166 -> "2,505,166". */
+int group_u64_snprintf(uint64_t n, char *str, size_t str_bytes)
+{
+	char tmp[21];		/* up to 20 digits for UINT64_MAX, plus NUL */
+	int len, i, out = 0;
+
+	if (str_bytes == 0)
+		return 0;
+	len = snprintf(tmp, sizeof(tmp), "%"PRIu64, n);
+	for (i = 0; i < len && (size_t)out < str_bytes - 1; i++) {
+		if (i > 0 && (len - i) % 3 == 0 && (size_t)out < str_bytes - 1)
+			str[out++] = ',';
+		if ((size_t)out < str_bytes - 1)
+			str[out++] = tmp[i];
+	}
+	str[out] = '\0';
+	return out;
 }
 
 /* Human-readable size (KiB/MiB/...); pretty_size_snprintf prints raw bytes. */

@@ -944,7 +944,11 @@ static void print_header(void)
 #ifdef	DEBUG_BUILD
 	printf("Debug build, performance may be impacted.\n");
 #endif
-	qprintf("%s%sScanning%s files...\n", col_bold, col_cyan, col_reset);
+	/*
+	 * No "Scanning files..." banner: the live stage line (scanning / hashing
+	 * / dedupe / done) is the single source of phase truth now, and a banner
+	 * left above the worker block contradicts that unified view.
+	 */
 }
 
 /* Process the dedupe generations in (seq_lo, seq_hi]. */
@@ -1034,30 +1038,47 @@ static void process_duplicates(struct dbhandle *db)
 	passes = max > first_seq ? (max - first_seq + stride - 1) / stride : 0;
 
 	/*
-	 * Ensure the find-dupes indexes exist. Normally built at the end of the
-	 * scan; this covers read-only runs (no scan this invocation) and older
-	 * hashfiles. Best-effort: the indexes only speed up the lookups below,
-	 * which are correct without them, so a failure here (e.g. a read-only
-	 * hashfile) is logged by the callee but must not abort the dedupe.
+	 * Start the live dedupe block first, then do the deferred post-scan prep
+	 * under it so the seconds it can take on a big hashfile animate instead of
+	 * freezing the display. With the printer running, qprintf() routes these
+	 * status lines above the block (see progress_print). The prep:
+	 *   - drop rows for files deleted from disk since they were scanned, so a
+	 *     stale hashfile does not grow and the dedupe phase does not load
+	 *     phantom groups (must precede the count and the per-pass loads);
+	 *   - build the find-dupes indexes (deferred from the scan so it is not
+	 *     maintained per row). Best-effort: the lookups are correct without
+	 *     them, so a failure here (e.g. a read-only hashfile) must not abort;
+	 *   - estimate the dup-group total so the bar and ETA have a scale.
+	 * The pdedupe_set_activity() calls are harmless no-ops without a live block.
 	 */
+	if (options.run_dedupe)
+		pdedupe_begin(passes);
+
+	if (options.hashfile)
+		qprintf("Hashfile \"%s\" written\n", options.hashfile);
+
+	pdedupe_set_activity("checking for deleted files");
+	{
+		int64_t pruned = filescan_prune_deleted(db);
+
+		if (pruned > 0)
+			qprintf("Pruned %lld deleted file%s from the hashfile\n",
+				(long long)pruned, pruned == 1 ? "" : "s");
+	}
+
+	pdedupe_set_activity("building search indexes");
 	(void)dbfile_create_search_indexes(db);
 
-	/* Spawn a dedicated thread pool to block-based lookup */
+	/* Spawn a dedicated thread pool for block-based lookup */
 	if (options.do_block_hash)
 		extents_search_init();
 
-	/* One status area + one summary spanning every batch below. Estimate
-	 * the total dup-group count first so the progress and ETA have a
-	 * scale. */
 	if (options.run_dedupe) {
 		unsigned long long total;
 
-		if (!quiet && isatty(STDOUT_FILENO)) {
-			printf("  %sAnalyzing duplicates...%s\r", col_dim, col_reset);
-			fflush(stdout);
-		}
+		pdedupe_set_activity("analyzing duplicates");
 		total = dbfile_count_dupe_groups(db, options.only_whole_files);
-		pdedupe_begin(total, passes);
+		pdedupe_set_estimate(total);
 	}
 
 	for (unsigned int i = first_seq; i < max; i += stride) {
@@ -1178,8 +1199,18 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 
 	pscan_finish_listing();
 	filescan_free();
-	if (!quiet)
-		pscan_join();
+	if (!quiet) {
+		/*
+		 * A live dedupe phase (the only one that keeps drawing the block)
+		 * runs when deduping on an interactive, non-verbose tty. Tell the
+		 * scan to leave its worker block in place for it; otherwise the
+		 * area is wiped clean.
+		 */
+		bool dedupe_live = options.run_dedupe && !verbose &&
+				   isatty(STDOUT_FILENO);
+
+		pscan_join(dedupe_live);
+	}
 
 	/*
 	 * Latch the per-run file count here, while the scan owns the progress
@@ -1194,14 +1225,10 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		return ret;
 
 	/*
-	 * The bulk insert is done; build the find-dupes indexes now (deferred
-	 * from open so scanning does not maintain them per row).
-	 */
-	ret = dbfile_create_search_indexes(db);
-	if (ret)
-		return ret;
-
-	/*
+	 * Note: the find-dupes indexes are built later, in process_duplicates(),
+	 * so the (deferred, potentially slow) build happens under the live dedupe
+	 * block rather than during a frozen gap after hashing.
+	 *
 	 * Sync the locked filesystem informations in the hashfile
 	 */
 	fs_get_locked_uuid(&(dbfile_cfg.fs_uuid));
@@ -1489,23 +1516,10 @@ int main(int argc, char **argv)
 		persist_scan_config(db, roots, numfiles);
 
 	/*
-	 * Drop rows for files deleted from disk since they were scanned,
-	 * so a stale hashfile does not keep growing and does not make the
-	 * dedupe phase load phantom groups. Before process_duplicates()
-	 * so it works on the pruned set.
+	 * process_duplicates() does the post-scan prep (prune deleted files,
+	 * build the find-dupes indexes, count groups) under the live dedupe
+	 * block, so those seconds animate instead of freezing the display.
 	 */
-	{
-		int64_t pruned = filescan_prune_deleted(db);
-
-		if (pruned > 0)
-			qprintf("Pruned %lld deleted file%s from the "
-				"hashfile\n", (long long)pruned,
-				pruned == 1 ? "" : "s");
-	}
-
-	if (options.hashfile)
-		qprintf("Hashfile \"%s\" written\n", options.hashfile);
-
 	process_duplicates(db);
 
 	/* Append this run to the hashfile's history (fuels --history / --json). */

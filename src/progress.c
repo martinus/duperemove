@@ -70,6 +70,22 @@ unsigned int w_col;
  */
 static unsigned int drawn_lines;
 
+/*
+ * The unified live display walks a run through four monotonic stages. The stage
+ * line shows all four at once, each with a spinner (running), a tick (finished)
+ * or a dim dot (pending); the progress bar and detail line below it describe
+ * whichever stage is the current live edge. See docs/progress-ui-spec.md.
+ */
+enum stage { STAGE_SCAN, STAGE_HASH, STAGE_DEDUPE, STAGE_DONE, STAGE_COUNT };
+enum stage_state { ST_PENDING, ST_RUNNING, ST_DONE };
+
+static enum stage_state stages[STAGE_COUNT];
+
+static void stage_set(enum stage s, enum stage_state st)
+{
+	stages[s] = st;
+}
+
 /* Sums of the per-thread stats */
 static uint64_t files_scanned, bytes_scanned;
 
@@ -173,6 +189,7 @@ static void progress_wipe(void)
 void pscan_finish_listing(void)
 {
 	pscan.listing_completed = true;
+	stage_set(STAGE_SCAN, ST_DONE);
 }
 
 void pscan_set_progress(uint64_t added_files, uint64_t added_bytes)
@@ -186,8 +203,9 @@ void pscan_examined(void)
 	pscan.files_examined++;	/* listing is single-threaded; plain ++ is fine */
 }
 
-/* Files that needed (re)hashing this run - the work actually done, and unlike
- * files_examined it is not periodically cleared by the progress renderer. */
+/* Files that needed (re)hashing this run - the work actually done. Distinct
+ * from files_examined, which counts every file the walk visited (including
+ * those already up to date). */
 uint64_t pscan_files_scanned(void)
 {
 	return pscan.total_files_count;
@@ -217,166 +235,399 @@ static void ellipsize_path(const char *path, char *out, size_t out_len,
 	snprintf(out, out_len, "%.*s…%s", head, path, path + len - tail);
 }
 
-/* Short label per status (thread_idle is rendered separately below). Indexed
- * by the enum, so the order is irrelevant and adding a state is a one-liner. */
-static const char *const status_label[] = {
-	[thread_mapping]	= "mapping:",
-	[thread_scanning]	= "hashing:",
-	[thread_waiting_lock]	= "wait lock:",
-	[thread_committing]	= "commit:",
-	[thread_deduping]	= "deduping:",
+static const char *const stage_name[STAGE_COUNT] = {
+	[STAGE_SCAN]	= "scanning",
+	[STAGE_HASH]	= "hashing",
+	[STAGE_DEDUPE]	= "dedupe",
+	[STAGE_DONE]	= "done",
 };
 
-static void print_thread_progress(struct pscan_thread *tprogress)
+/* Accent color per stage (also colors that stage's bar and prefix). */
+static const char *stage_color(enum stage s)
+{
+	switch (s) {
+	case STAGE_SCAN:	return col_blue;
+	case STAGE_HASH:	return col_cyan;
+	case STAGE_DEDUPE:	return col_green;
+	default:		return col_green;
+	}
+}
+
+/* Braille spinner cycle; one frame advances per render (see the timer loop). */
+static const char *const spinner_frames[] = {
+	"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+};
+static unsigned int spin_frame;
+
+static const char *spinner_glyph(void)
+{
+	return tty ? spinner_frames[spin_frame % ARRAY_SIZE(spinner_frames)]
+		   : "*";
+}
+
+/* Progress-bar cells: full, an 8-level sub-cell ramp, and the empty dot. */
+static const char *const BAR_SUB[] = {
+	" ", "⡀", "⡄", "⡆", "⡇", "⣇", "⣧", "⣷", "⣿",
+};
+#define BAR_FULL	"⣿"
+#define BAR_EMPTY	"·"
+#define BAR_WIDTH	40
+#define STAGE_PREFIX_W	8	/* widest stage name ("scanning") */
+#define STATUS_COL_W	9	/* widest worker status ("wait lock") */
+/* Worker-line left column: number(3) + gap(2) + status + gap(2) before the path. */
+#define WORKER_LEFT_W	(3 + 2 + STATUS_COL_W + 2)
+
+/* The dim " · " separator between fields on the bar and detail lines. */
+static void detail_sep(void)
+{
+	printf(" %s·%s ", col_dim, col_reset);
+}
+
+/* Worker status word (no colon) and its color. thread_scanning is "hashing". */
+static const char *status_word(enum pscan_thread_status s)
+{
+	switch (s) {
+	case thread_idle:		return "idle";
+	case thread_mapping:		return "mapping";
+	case thread_scanning:		return "hashing";
+	case thread_waiting_lock:	return "wait lock";
+	case thread_committing:		return "commit";
+	case thread_deduping:		return "deduping";
+	}
+	return "";
+}
+
+static const char *status_color(enum pscan_thread_status s)
+{
+	switch (s) {
+	case thread_idle:		return col_dim;
+	case thread_mapping:		return col_blue;
+	case thread_scanning:		return col_cyan;
+	case thread_waiting_lock:	return col_yellow;
+	case thread_committing:		return col_magenta;
+	case thread_deduping:		return col_green;
+	}
+	return col_reset;
+}
+
+static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 {
 	char buf[BUF_LEN];
-	char prefix[64], suffix[128], path[PATH_MAX + 4];
-	char clean[PATH_MAX + 1];
-	int avail;
+	char path[PATH_MAX + 4], clean[PATH_MAX + 1];
+	char m_plain[160], m_col[512];
+	const char *word = status_word(t->status);
+	const char *wcol = status_color(t->status);
+	int avail, termw;
 
-	/* The only thing that varies is the suffix: a byte percentage while
-	 * hashing/deduping, else a size (no bytes processed yet to show a %). */
-	switch (tprogress->status) {
-	case thread_idle:
-		s_printf("[%u] idle\n", tprogress->tid);
+	/* Idle slots are just the dim number and word - nothing on the right. */
+	if (t->status == thread_idle) {
+		s_printf("%s%3u%s  %s%s%s\n",
+			 col_dim, slot, col_reset, wcol, word, col_reset);
 		return;
-	case thread_scanning:
-	case thread_deduping:
-		snprintf(suffix, sizeof(suffix), ": %s/%s (%05.2f%%)",
-			 human_size(tprogress->file_scanned_bytes),
-			 human_size(tprogress->file_total_bytes),
-			 percent(tprogress->file_scanned_bytes,
-				 tprogress->file_total_bytes));
-		break;
-	case thread_mapping:
-	case thread_waiting_lock:
-	case thread_committing:
-		snprintf(suffix, sizeof(suffix), " (size: %s)",
-			 human_size(tprogress->file_total_bytes));
-		break;
 	}
 
-	snprintf(prefix, sizeof(prefix), "[%u] %-11s", tprogress->tid,
-		 status_label[tprogress->status]);
+	/*
+	 * The metrics are built twice: a plain copy (to budget the path width by
+	 * visible columns) and a colored copy (what is actually printed). The
+	 * done size is bold, the "/" and total are dim, the percent takes the
+	 * status color - so the numbers stand out from the path.
+	 */
+	switch (t->status) {
+	case thread_scanning:
+	case thread_deduping: {
+		char ds[32], ts[32];
+		double p = percent(t->file_scanned_bytes, t->file_total_bytes);
+
+		human_size_snprintf(t->file_scanned_bytes, ds, sizeof(ds));
+		human_size_snprintf(t->file_total_bytes, ts, sizeof(ts));
+		snprintf(m_plain, sizeof(m_plain), "%s/%s (%05.2f%%)", ds, ts, p);
+		snprintf(m_col, sizeof(m_col),
+			 "%s%s%s%s/%s%s %s(%05.2f%%)%s",
+			 col_bold, ds, col_reset, col_dim, ts, col_reset,
+			 wcol, p, col_reset);
+		break;
+	}
+	default: {	/* mapping / wait lock / commit: size only, no bytes yet */
+		char ss[32];
+
+		human_size_snprintf(t->file_total_bytes, ss, sizeof(ss));
+		snprintf(m_plain, sizeof(m_plain), "(size: %s)", ss);
+		snprintf(m_col, sizeof(m_col), "%s(size: %s)%s",
+			 col_dim, ss, col_reset);
+		break;
+	}
+	}
 
 	/*
-	 * The numbers on the right must stay visible: give the path whatever
-	 * width remains and shorten its middle, never the suffix.
-	 *
-	 * When the terminal width is unknown (some SSH ptys report 0 columns),
-	 * fall back to 80 rather than not truncating at all: an untruncated long
-	 * path wraps onto a second physical row, which desyncs the fixed-height
-	 * progress area (the cursor moves up N rows but N+ were drawn) and leaves
-	 * the top lines frozen. 80 never over-estimates a real terminal, so the
-	 * line can't wrap.
+	 * Give the path whatever width remains after the fixed prefix (number +
+	 * status column), a two-space gap, and the metrics, then shorten its
+	 * middle. When the terminal width is unknown (some SSH ptys report 0
+	 * columns), fall back to 80 so a long path can't wrap onto a second row
+	 * and desync the fixed-height area. Color codes are zero-width, so the
+	 * budget is computed from the plain metrics only.
 	 */
-	avail = (int)(w_col == UINT_MAX ? 80 : w_col)
-		- (int)strlen(prefix) - (int)strlen(suffix);
+	termw = (int)(w_col == UINT_MAX ? 80 : w_col);
+	avail = termw - WORKER_LEFT_W - (int)strlen(m_plain) - 2;	/* -2: gap before metrics */
 	/* Never emit raw control bytes from a filename to the terminal (#353). */
-	sanitize_ctrl(tprogress->file_path, clean, sizeof(clean));
+	sanitize_ctrl(t->file_path, clean, sizeof(clean));
 	ellipsize_path(clean, path, sizeof(path), avail);
 
-	/*
-	 * No byte-truncation here: it would eat the suffix (the ellipsis is
-	 * three bytes for one column). Column width never exceeds byte length
-	 * in UTF-8, so the width budget above already guarantees the fit.
-	 */
-	snprintf(buf, BUF_LEN, "%s%s%s", prefix, path, suffix);
+	snprintf(buf, BUF_LEN, "%s%3u%s  %s%-*s%s  %s  %s",
+		 col_dim, slot, col_reset,
+		 wcol, STATUS_COL_W, word, col_reset, path, m_col);
 	s_printf("%s\n", buf);
 }
 
-/* Returns the number of lines printed (fixed at 3), for the relative redraw. */
-static unsigned int print_scan_progress(void)
+/* The four-word stage line: glyph + word per stage, colored by tri-state. */
+static unsigned int print_stage_line(void)
 {
-	uint64_t tf = pscan.total_files_count;
-	uint64_t tb = pscan.total_bytes_count;
-	double elapsed = elapsed_seconds();
+	if (tty)
+		fputs("\033[K", stdout);
+
+	for (enum stage s = 0; s < STAGE_COUNT; s++) {
+		const char *acc = stage_color(s);
+
+		if (s)
+			fputs("   ", stdout);
+
+		switch (stages[s]) {
+		case ST_DONE:
+			printf("%s%s%s %s%s%s", col_green, tty ? "✔" : "x",
+			       col_reset, col_green, stage_name[s], col_reset);
+			break;
+		case ST_RUNNING:
+			printf("%s%s%s %s%s%s%s", acc, spinner_glyph(), col_reset,
+			       col_bold, acc, stage_name[s], col_reset);
+			break;
+		default:	/* ST_PENDING */
+			printf("%s%s %s%s", col_dim, tty ? "·" : "-",
+			       stage_name[s], col_reset);
+			break;
+		}
+	}
+	putchar('\n');
+	return 1;
+}
+
+/*
+ * A BAR_WIDTH-cell braille bar in the stage accent color. `indet` draws a
+ * bouncing lit window (used while the hashing total is still unknown); else the
+ * bar fills to `frac` with an 8-level sub-cell for the fractional part.
+ */
+static void render_bar(double frac, bool indet, const char *acc)
+{
+	putchar('[');
+
+	if (!tty) {	/* plain ASCII for logs / non-tty */
+		int f = indet ? 0 : (int)(frac * BAR_WIDTH + 0.5);
+
+		for (int i = 0; i < BAR_WIDTH; i++)
+			putchar(i < f ? '#' : '-');
+		putchar(']');
+		return;
+	}
+
+	if (indet) {
+		int win = 8, span = BAR_WIDTH - win;
+		int q = span ? (int)(spin_frame % (2u * (unsigned)span)) : 0;
+		int pos = q <= span ? q : 2 * span - q;
+
+		for (int i = 0; i < BAR_WIDTH; i++) {
+			bool lit = i >= pos && i < pos + win;
+
+			if (lit)
+				printf("%s%s%s", acc, BAR_FULL, col_reset);
+			else
+				printf("%s%s%s", col_dim, BAR_EMPTY, col_reset);
+		}
+	} else {
+		int eighths, full, rem, printed = 0;
+
+		if (frac < 0.0)
+			frac = 0.0;
+		if (frac > 1.0)
+			frac = 1.0;
+		eighths = (int)(frac * BAR_WIDTH * 8 + 0.5);
+		full = eighths / 8;
+		rem = eighths % 8;
+
+		printf("%s", acc);
+		for (; printed < full && printed < BAR_WIDTH; printed++)
+			fputs(BAR_FULL, stdout);
+		if (rem && printed < BAR_WIDTH) {
+			fputs(BAR_SUB[rem], stdout);
+			printed++;
+		}
+		printf("%s%s", col_reset, col_dim);
+		for (; printed < BAR_WIDTH; printed++)
+			fputs(BAR_EMPTY, stdout);
+		printf("%s", col_reset);
+	}
+	putchar(']');
+}
+
+/* The current live-edge stage: dedupe once that phase is running, else hashing. */
+static enum stage current_stage(void)
+{
+	return pdd.phase ? STAGE_DEDUPE : STAGE_HASH;
+}
+
+/* Stage-prefixed progress bar + percent + ETA for the current stage. */
+static unsigned int print_bar_line(void)
+{
+	enum stage cs = current_stage();
+	const char *acc = stage_color(cs);
+	bool indet = false;
+	double frac = 0.0, eta = -1.0;
+	unsigned int pct = 0;
+
+	if (pdd.phase) {
+		uint64_t done = pdd.done, queued = pdd.queued;
+		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
+		double elapsed = (g_get_monotonic_time() - pdd.start_us) / 1e6;
+
+		/* Fuzzy total: cap at 99% while the phase is still running. */
+		if (total) {
+			frac = (double)done / total;
+			pct = (unsigned int)(100.0 * done / total);
+			if (pct > 99)
+				pct = 99;
+		} else {
+			/* No group count yet (still analyzing): bounce the bar. */
+			indet = true;
+		}
+		if (done > 20 && elapsed > 2.0 && done < total)
+			eta = (total - done) / (done / elapsed);
+	} else if (!pscan.listing_completed) {
+		/* Hashing total not known until the listing finishes. */
+		indet = true;
+	} else {
+		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
+		double elapsed = elapsed_seconds();
+		double done = (double)bytes_scanned +
+			      (double)eta_file_weight * files_scanned;
+		double total = (double)tb + (double)eta_file_weight * tf;
+
+		frac = total > 0.0 ? done / total : 1.0;
+		pct = (unsigned int)(frac * 100.0);
+		eta = scan_eta_seconds(bytes_scanned, files_scanned, tb, tf,
+				       eta_file_weight, elapsed);
+	}
+
+	s_printf("%s%-*s%s  ", acc, STAGE_PREFIX_W, stage_name[cs], col_reset);
+	render_bar(frac, indet, acc);
+	if (!indet) {
+		printf("  %s%u%%%s", col_bold, pct, col_reset);
+		if (eta > 0.0) {
+			detail_sep();
+			printf("ETA ~%s", human_duration(eta));
+		}
+	}
+	putchar('\n');
+	return 1;
+}
+
+/*
+ * One line of concrete numbers for the current stage. Indented to line up under
+ * the bar (the stage-name prefix + its two spaces) and with no leading word -
+ * the stage line above already names the phase.
+ */
+static unsigned int print_detail_line(void)
+{
+	s_printf("%*s", STAGE_PREFIX_W + 2, "");
+
+	if (pdd.phase) {
+		uint64_t done = pdd.done, queued = pdd.queued;
+		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
+		uint64_t sd = search_processed, st = search_total;
+		bool pool_idle = true;
+
+		/*
+		 * The dedupe pool drains between batches while the main thread
+		 * loads / groups the next batch, so every worker slot sits idle for
+		 * a beat. Detect that and surface the current activity, so those
+		 * pauses read as work-in-progress rather than a hang.
+		 */
+		for (unsigned int i = 0; i < pscan.thread_count; i++)
+			if (pscan.threads[i]->status != thread_idle) {
+				pool_idle = false;
+				break;
+			}
+
+		/*
+		 * Before the first group is deduped there is no numeric progress
+		 * yet - show what the phase is doing (analyzing duplicates, loading
+		 * identical files, ...) here under the bar instead of "0 / ~0".
+		 */
+		if (done == 0 && pdd.activity) {
+			printf("%s", pdd.activity);
+			if (st) {
+				detail_sep();
+				printf("%s/%s files", group_u64(sd), group_u64(st));
+			}
+			putchar('\n');
+			return 1;
+		}
+
+		printf("%s%s%s / ~%s groups",
+		       col_bold, group_u64(done), col_reset, group_u64(total));
+		if (pdd.batches > 1) {
+			detail_sep();
+			printf("batch %u/%u", pdd.batch, pdd.batches);
+		}
+		if (st) {
+			detail_sep();
+			printf("searching extents %s/%s", group_u64(sd), group_u64(st));
+		} else if (pool_idle && pdd.activity) {
+			detail_sep();
+			printf("%s", pdd.activity);
+		}
+		detail_sep();
+		printf("reclaimed %s%s%s\n", col_green,
+		       human_size(pdd.reclaimed), col_reset);
+		return 1;
+	}
 
 	if (!pscan.listing_completed) {
 		/*
-		 * During discovery the total isn't known yet (and most files may
-		 * be up to date, so total_files_count stays low). Show what we do
-		 * know - files walked and how many need (re)hashing - rather than
-		 * a misleading 0/0.
+		 * files_examined is the cumulative count of files the walk has
+		 * visited (reset once at pscan_run); total_files_count is how many
+		 * of them need (re)hashing. Both climb monotonically during listing.
 		 */
-		s_printf("\tListing files: %" PRIu64 " examined\n",
-			 pscan.files_examined);
-		s_printf("\t%" PRIu64 " need hashing\n", tf);
-		s_printf("\tFile listing: in progress\n");
-		return 3;
+		printf("%s%s%s files", col_bold,
+		       group_u64(pscan.files_examined), col_reset);
+		detail_sep();
+		printf("%s%s%s need hashing\n", col_bold,
+		       group_u64(pscan.total_files_count), col_reset);
+		return 1;
 	}
 
-	/* Files/s for the display line; 0 until we have a second of data. */
-	double frate = (files_scanned && elapsed > 1.0) ? files_scanned / elapsed : 0.0;
+	{
+		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
+		double elapsed = elapsed_seconds();
 
-	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)",
-	      files_scanned, tf, tf ? (double)files_scanned / tf * 100 : 100.0);
-	if (frate > 0.0)
-		printf(" · %.0f files/s", frate);
-	printf("\n");
-
-	s_printf("\tBytes scanned: %s/%s (%05.2f%%)",
-	      human_size(bytes_scanned), human_size(tb),
-	      tb ? (double)bytes_scanned / tb * 100 : 100.0);
-	if (bytes_scanned && elapsed > 1.0) {
-		double brate = bytes_scanned / elapsed;
-		double eta = scan_eta_seconds(bytes_scanned, files_scanned,
-					      tb, tf, eta_file_weight, elapsed);
-
-		printf(" · %s/s", human_size((uint64_t)brate));
-		if (eta > 0.0)
-			printf(" · ETA ~%s", human_duration(eta));
+		printf("%s%s%s / %s files", col_bold,
+		       group_u64(files_scanned), col_reset, group_u64(tf));
+		detail_sep();
+		printf("%s / %s", human_size(bytes_scanned), human_size(tb));
+		if (bytes_scanned && elapsed > 1.0) {
+			detail_sep();
+			printf("%s/s", human_size((uint64_t)(bytes_scanned / elapsed)));
+		}
+		putchar('\n');
+		return 1;
 	}
-	printf("\n");
-	s_printf("\tFile listing: completed\n");
-	return 3;
 }
 
-/* Returns the number of lines printed (fixed at 3), for the relative redraw. */
-static unsigned int print_dedupe_progress(void)
-{
-	uint64_t done = pdd.done;
-	uint64_t queued = pdd.queued;
-	uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
-	uint64_t sd = search_processed, st = search_total;
-	double elapsed = (g_get_monotonic_time() - pdd.start_us) / 1e6;
-	unsigned int pct = 0;
-
-	/*
-	 * The total is fuzzy until the very last batch is queued (and the
-	 * whole-file pass shrinks the extent-group count as it goes), so mark
-	 * it "~" and never claim 100% while the phase is still running.
-	 */
-	if (total) {
-		pct = (unsigned int)(100.0 * done / total);
-		if (pct > 99)
-			pct = 99;
-	}
-
-	s_printf("\tGroups deduped: %" PRIu64 "/~%" PRIu64 " (%u%%)",
-		 done, total, pct);
-	if (pdd.batches > 1)
-		printf(" · batch %u/%u", pdd.batch, pdd.batches);
-	printf("\n");
-
-	s_printf("\tSpace reclaimed: %s\n", human_size(pdd.reclaimed));
-
-	s_printf("\tStatus: %s", pdd.activity ? pdd.activity : "working");
-	if (st)
-		printf(" (%" PRIu64 "/%" PRIu64 " files)", sd, st);
-	if (elapsed > 1.0)
-		printf(" · elapsed %s", human_duration(elapsed));
-	if (done > 20 && elapsed > 2.0 && done < total)
-		printf(" · ETA ~%s",
-		       human_duration((total - done) / (done / elapsed)));
-	printf("\n");
-	return 3;
-}
-
-/* Returns the number of lines printed. */
+/* Render the whole live totals block (stage line, bar, detail). */
 static unsigned int print_total_progress(void)
 {
-	return pdd.phase ? print_dedupe_progress() : print_scan_progress();
+	unsigned int lines = 0;
+
+	lines += print_stage_line();
+	lines += print_bar_line();
+	lines += print_detail_line();
+	return lines;
 }
 
 static void prepare_screen_area(void)
@@ -395,16 +646,20 @@ static void *print_progress(void)
 
 	files_scanned = 0;
 	bytes_scanned = 0;
-	pscan.files_examined = 0;
 
 	progress_home();	/* back to the top of the block we drew last time */
 
+	/* Worker lines on top, numbered 1..N (the slot index, not the pid). */
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
-		print_thread_progress(pscan.threads[i]);
+		print_thread_progress(pscan.threads[i], i + 1);
 		lines++;
 		files_scanned += pscan.threads[i]->total_scanned_files;
 		bytes_scanned += pscan.threads[i]->total_scanned_bytes;
 	}
+
+	/* One blank spacer line between the workers and the stage indicator. */
+	s_printf("\n");
+	lines++;
 
 	lines += print_total_progress();
 
@@ -430,6 +685,8 @@ static void *pscan_progress_thread(void * p)
 		g_mutex_lock(&pscan.mutex);
 		print_progress();
 		g_mutex_unlock(&pscan.mutex);
+
+		spin_frame++;	/* advance every spinner + the indeterminate bar */
 
 		/* Do not waste too much cpu */
 		usleep(1000 * (tty ? 100 : 1000));
@@ -468,6 +725,14 @@ void pscan_run(void)
 {
 	tty = isatty(STDOUT_FILENO);
 
+	/* Scanning and hashing run together from the start; dedupe follows. */
+	stage_set(STAGE_SCAN, ST_RUNNING);
+	stage_set(STAGE_HASH, ST_RUNNING);
+	stage_set(STAGE_DEDUPE, ST_PENDING);
+	stage_set(STAGE_DONE, ST_PENDING);
+	spin_frame = 0;
+	pscan.files_examined = 0;	/* cumulative walk count, climbs to the total */
+
 	if (tty) {
 		/* hide the cursor */
 		printf("\33[?25l");
@@ -479,22 +744,40 @@ void pscan_run(void)
 	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
 }
 
-void pscan_join(void)
+void pscan_join(bool continues)
 {
 	g_thread_join(printer);
+	printer = NULL;
 
-	/* Show the cursor again */
-	printf("\33[?25h");
+	/* The listing is done (STAGE_SCAN) and the csum pool has drained. */
+	stage_set(STAGE_HASH, ST_DONE);
 
-	/* Wipe the live block, then leave the final totals in its place. */
+	if (continues) {
+		/*
+		 * A live dedupe phase will keep drawing this same block, so leave
+		 * it in place - workers and all - and just refresh it once so
+		 * hashing shows ticked. Nothing is wiped or stranded above the
+		 * dedupe view, and the worker list never blinks away. Threads,
+		 * drawn_lines and the hidden cursor are kept for the dedupe phase
+		 * (it reuses the now-idle slots and redraws over this block).
+		 */
+		g_mutex_lock(&pscan.mutex);
+		print_progress();
+		g_mutex_unlock(&pscan.mutex);
+		return;
+	}
+
+	/*
+	 * No live dedupe follows (print-only / non-tty / -v): wipe the live area
+	 * clean so the report or the next output starts on a fresh line. No
+	 * summary is left behind.
+	 */
+	if (tty)
+		printf("\33[?25h");	/* show the cursor again */
 	progress_home();
 	progress_wipe();
 	drawn_lines = 0;
-	print_total_progress();
-
 	pscan_free_threads();
-
-	printer = NULL;
 }
 
 void pscan_reset_thread(struct pscan_thread **progress)
@@ -608,18 +891,25 @@ struct pscan_thread *pscan_claim_slot(pid_t tid,
 	return slot;
 }
 
-void pdedupe_begin(uint64_t estimated_groups, unsigned int batches)
+void pdedupe_begin(unsigned int batches)
 {
 	pdd.done = 0;
 	pdd.queued = 0;
 	pdd.reclaimed = 0;
 	pdd.net_shared = 0;
-	pdd.estimate = estimated_groups;
+	pdd.estimate = 0;		/* set later via pdedupe_set_estimate() */
 	pdd.batches = batches;
 	pdd.batch = batches ? 1 : 0;
 	pdd.activity = "analyzing duplicates";
 	pdd.start_us = g_get_monotonic_time();
 	pdd.phase = true;
+
+	/* Reaching dedupe means scanning and hashing are behind us. */
+	stage_set(STAGE_SCAN, ST_DONE);
+	stage_set(STAGE_HASH, ST_DONE);
+	stage_set(STAGE_DEDUPE, ST_RUNNING);
+	stage_set(STAGE_DONE, ST_PENDING);
+	spin_frame = 0;
 
 	/*
 	 * The live area only makes sense on a tty; under -v the per-group
@@ -630,25 +920,36 @@ void pdedupe_begin(uint64_t estimated_groups, unsigned int batches)
 		return;
 
 	tty = true;
-	printf("\33[?25l");	/* hide the cursor */
-	prepare_screen_area();
+	printf("\33[?25l");	/* hide the cursor (a no-op if scan already did) */
+	/*
+	 * Do NOT reset drawn_lines here: the scan left its block in place (see
+	 * pscan_join with continues=true), so the first dedupe render redraws
+	 * over that same block, keeping the worker list continuous. When there
+	 * was no scan block (drawn_lines already 0) this simply draws fresh.
+	 */
 	pdd.running = 1;
 	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
 }
 
 void pdedupe_end(void)
 {
+	/* Whole run is finished: tick dedupe and done. */
+	stage_set(STAGE_DEDUPE, ST_DONE);
+	stage_set(STAGE_DONE, ST_DONE);
+
 	if (pdd.running) {
 		pdd.running = 0;
 		g_thread_join(printer);
 		printer = NULL;
 
-		/* Show the cursor again and wipe the status area; the caller
-		 * prints the final summary. */
+		/* Show the cursor again, wipe the live block, and leave the
+		 * fully-ticked stage line in place; the caller prints the final
+		 * summary below it. */
 		printf("\33[?25h");
 		progress_home();
 		progress_wipe();
 		drawn_lines = 0;
+		print_stage_line();
 		fflush(stdout);
 	}
 	pscan_free_threads();
@@ -663,6 +964,11 @@ void pdedupe_set_batch(unsigned int cur)
 void pdedupe_set_activity(const char *activity)
 {
 	pdd.activity = activity;
+}
+
+void pdedupe_set_estimate(uint64_t estimated_groups)
+{
+	pdd.estimate = estimated_groups;
 }
 
 void pdedupe_add_queued(uint64_t ngroups)

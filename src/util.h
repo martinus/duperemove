@@ -50,6 +50,15 @@ int human_size_snprintf(uint64_t size, char *str, size_t str_bytes);
 		_hs;							\
 	})
 
+/* Group digits in threes with a ',' separator: 2505166 -> "2,505,166". */
+int group_u64_snprintf(uint64_t n, char *str, size_t str_bytes);
+#define group_u64(n)							\
+	({								\
+		static __thread char _gu[28];				\
+		(void)group_u64_snprintf((n), _gu, sizeof(_gu));	\
+		_gu;							\
+	})
+
 /* Compact human-readable duration ("2m14s"). */
 int human_duration_snprintf(double seconds, char *str, size_t str_bytes);
 #define human_duration(secs)						\
@@ -66,6 +75,7 @@ int human_duration_snprintf(double seconds, char *str, size_t str_bytes);
  */
 extern const char *col_reset, *col_bold, *col_dim;
 extern const char *col_red, *col_green, *col_yellow, *col_blue, *col_cyan;
+extern const char *col_magenta;
 void color_init(bool disable);
 
 /* Monotonic seconds since the process recorded its start (see start_timer). */

@@ -319,6 +319,35 @@ MU_TEST(test_scan_eta) {
 	mu_check(near(scan_eta_seconds(4 * GiB, 4, 4 * GiB, 4, W, 10.0), 0.0, 1e-6));
 }
 
+MU_TEST(test_group_u64) {
+	char b[28];
+
+	/* Under 1000: unchanged. */
+	group_u64_snprintf(0, b, sizeof(b));
+	mu_check(strcmp(b, "0") == 0);
+	group_u64_snprintf(7, b, sizeof(b));
+	mu_check(strcmp(b, "7") == 0);
+	group_u64_snprintf(999, b, sizeof(b));
+	mu_check(strcmp(b, "999") == 0);
+
+	/* Separators every three digits from the right. */
+	group_u64_snprintf(1000, b, sizeof(b));
+	mu_check(strcmp(b, "1,000") == 0);
+	group_u64_snprintf(12000, b, sizeof(b));
+	mu_check(strcmp(b, "12,000") == 0);
+	group_u64_snprintf(2505166, b, sizeof(b));
+	mu_check(strcmp(b, "2,505,166") == 0);
+
+	/* Full width UINT64_MAX still fits the 28-byte buffer. */
+	group_u64_snprintf(18446744073709551615ull, b, sizeof(b));
+	mu_check(strcmp(b, "18,446,744,073,709,551,615") == 0);
+
+	/* Truncation stays NUL-terminated and within bounds. */
+	char small[4];
+	group_u64_snprintf(2505166, small, sizeof(small));
+	mu_check(small[3] == '\0' && strlen(small) <= 3);
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -330,6 +359,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_scan_bucket);
 	MU_RUN_TEST(test_scan_workq_priority);
 	MU_RUN_TEST(test_scan_eta);
+	MU_RUN_TEST(test_group_u64);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

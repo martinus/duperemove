@@ -20,7 +20,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 WORK="${DEMO_DIR:-$PWD}"
 OUT="${OUT:-$WORK/demo.gif}"
-FONT="${FONT:-Hack}"
+FONT="${FONT:-IosevkaTerm Nerd Font}"   # used only by the asciinema+agg fallback
 LOSSY="${DEMO_LOSSY:-60}"   # gifsicle --lossy level; higher = smaller GIF, more speckle
 
 # Build oans if needed and expose it on PATH for the recording — without copying
@@ -34,7 +34,7 @@ export OANS_BIN_DIR="$repo"
 
 if command -v vhs >/dev/null; then
   echo "recording with vhs ..."
-  ( cd "$WORK" && vhs "$here/demo.tape" )   # writes demo.gif
+  ( cd "$WORK" && vhs "$here/demo.tape" )   # writes demo.gif at the tape's framerate
   [ "$WORK/demo.gif" -ef "$OUT" ] 2>/dev/null || mv -f "$WORK/demo.gif" "$OUT"
 elif command -v asciinema >/dev/null && command -v agg >/dev/null; then
   echo "recording with asciinema + agg ..."
@@ -51,11 +51,13 @@ else
   exit 1
 fi
 
-# Optimize the GIF: a quality-neutral ~30% shrink for flat terminal colours.
+# Optimize the GIF: quantize to a small palette (a terminal cast uses only a
+# handful of colours) and lossy-compress — a large shrink with no visible loss,
+# which matters most for the longer cold-scan recording.
 if command -v gifsicle >/dev/null; then
-  gifsicle -O3 --lossy="$LOSSY" "$OUT" -o "$OUT.tmp" 2>/dev/null && mv -f "$OUT.tmp" "$OUT" || rm -f "$OUT.tmp"
+  gifsicle -O3 --colors 32 --lossy="$LOSSY" "$OUT" -o "$OUT.tmp" 2>/dev/null && mv -f "$OUT.tmp" "$OUT" || rm -f "$OUT.tmp"
 else
-  echo "note: install gifsicle to shrink the GIF (~30% smaller)." >&2
+  echo "note: install gifsicle to shrink the GIF." >&2
 fi
 
 # Tidy up the dataset (keep the gif).

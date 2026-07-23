@@ -91,12 +91,16 @@ reclaim_kb=$(cat "$DEST/.reclaim")
 rm -f "$DEST"/.jobs_gen "$DEST"/.jobs_copy "$DEST"/.chunk_gen.* "$DEST"/.reclaim
 
 # 5) Drop the page cache so the recorded scan reads cold from disk (realistic,
-#    and it makes the hashing phase visibly longer). Needs root; best-effort.
+#    and it makes the hashing phase visibly longer). Works without an interactive
+#    root shell: a direct write when running as root, otherwise the passwordless
+#    `sudo -n tee /proc/sys/vm/drop_caches` that dev boxes grant for exactly this
+#    (the same mechanism scripts/bench.py uses). Best-effort.
 if [ "${DROP_CACHES:-1}" = 1 ]; then
   sync
-  if ! { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null; then
-    sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null \
-      || echo "note: could not drop caches (need root); scan reads warm cache. Set DROP_CACHES=0 to skip." >&2
+  if ! { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null \
+     && ! echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1; then
+    echo "note: could not drop caches (need root, or passwordless" \
+         "'sudo tee /proc/sys/vm/drop_caches'); scan reads warm. DROP_CACHES=0 to skip." >&2
   fi
 fi
 
