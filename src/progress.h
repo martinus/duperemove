@@ -73,10 +73,21 @@ struct pscan_thread *pscan_register_thread(pid_t tid);
 void pscan_run(void);
 
 /*
- * Wait for the progress thread to finish
- * Also cleanup per-thread progresses and print the global totals
+ * Wait for the scan progress thread to finish. When `continues` is true a live
+ * dedupe phase will keep drawing the same on-screen block, so the worker block
+ * is left in place (refreshed to show hashing ticked) instead of being wiped -
+ * the worker list never blinks away and nothing is stranded above the dedupe
+ * view. When false (print-only / non-tty / -v) the live area is wiped clean.
  */
-void pscan_join(void);
+void pscan_join(bool continues);
+
+/*
+ * True when an in-place live block is currently on screen (a tty with a drawn
+ * block). Between the scan and dedupe phases, callers route their status
+ * messages through pscan_printf() when this is true so the message lands above
+ * the block instead of corrupting the relative redraw.
+ */
+bool pscan_live_block(void);
 
 /*
  * Per-work-item reset for the churning dedupe pool: finish the current file's

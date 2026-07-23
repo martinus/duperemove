@@ -518,18 +518,23 @@ static unsigned int print_bar_line(void)
 	return 1;
 }
 
-/* One line of concrete numbers for the current stage. */
+/*
+ * One line of concrete numbers for the current stage. Indented to line up under
+ * the bar (the stage-name prefix + its two spaces) and with no leading word -
+ * the stage line above already names the phase.
+ */
 static unsigned int print_detail_line(void)
 {
 	if (tty)
 		fputs("\033[K", stdout);
+	printf("%*s", STAGE_PREFIX_W + 2, "");
 
 	if (pdd.phase) {
 		uint64_t done = pdd.done, queued = pdd.queued;
 		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
 		uint64_t sd = search_processed, st = search_total;
 
-		printf("Deduping %s%" PRIu64 "%s / ~%" PRIu64 " groups",
+		printf("%s%" PRIu64 "%s / ~%" PRIu64 " groups",
 		       col_bold, done, col_reset, total);
 		if (pdd.batches > 1)
 			printf(" %s·%s batch %u/%u", col_dim, col_reset,
@@ -548,8 +553,7 @@ static unsigned int print_detail_line(void)
 		 * (it shows the walk is live); total_files_count is the running
 		 * count needing (re)hashing.
 		 */
-		printf("Scanning %s%" PRIu64 "%s examined %s·%s "
-		       "%s%" PRIu64 "%s need hashing\n",
+		printf("%s%" PRIu64 "%s examined %s·%s %s%" PRIu64 "%s need hashing\n",
 		       col_bold, pscan.files_examined, col_reset,
 		       col_dim, col_reset,
 		       col_bold, pscan.total_files_count, col_reset);
@@ -560,7 +564,7 @@ static unsigned int print_detail_line(void)
 		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
 		double elapsed = elapsed_seconds();
 
-		printf("Hashing %s%" PRIu64 "%s / %" PRIu64 " files %s·%s %s / %s",
+		printf("%s%" PRIu64 "%s / %" PRIu64 " files %s·%s %s / %s",
 		       col_bold, files_scanned, col_reset, tf,
 		       col_dim, col_reset, human_size(bytes_scanned),
 		       human_size(tb));
@@ -699,31 +703,45 @@ void pscan_run(void)
 	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
 }
 
-void pscan_join(void)
+void pscan_join(bool continues)
 {
 	g_thread_join(printer);
+	printer = NULL;
 
 	/* The listing is done (STAGE_SCAN) and the csum pool has drained. */
 	stage_set(STAGE_HASH, ST_DONE);
 
-	/* Show the cursor again (only hidden on a tty). */
-	if (tty)
-		printf("\33[?25h");
+	if (continues) {
+		/*
+		 * A live dedupe phase will keep drawing this same block, so leave
+		 * it in place - workers and all - and just refresh it once so
+		 * hashing shows ticked. Nothing is wiped or stranded above the
+		 * dedupe view, and the worker list never blinks away. Threads,
+		 * drawn_lines and the hidden cursor are kept for the dedupe phase
+		 * (it reuses the now-idle slots and redraws over this block).
+		 */
+		g_mutex_lock(&pscan.mutex);
+		print_progress();
+		g_mutex_unlock(&pscan.mutex);
+		return;
+	}
 
 	/*
-	 * Wipe the live block and leave a compact scan summary (stage line +
-	 * detail) as scrollback; the worker lines are dropped. The dedupe phase
-	 * starts a fresh block below it.
+	 * No live dedupe follows (print-only / non-tty / -v): wipe the live area
+	 * clean so the report or the next output starts on a fresh line. No
+	 * summary is left behind.
 	 */
+	if (tty)
+		printf("\33[?25h");	/* show the cursor again */
 	progress_home();
 	progress_wipe();
 	drawn_lines = 0;
-	print_stage_line();
-	print_detail_line();
-
 	pscan_free_threads();
+}
 
-	printer = NULL;
+bool pscan_live_block(void)
+{
+	return tty && drawn_lines > 0;
 }
 
 void pscan_reset_thread(struct pscan_thread **progress)
@@ -866,8 +884,13 @@ void pdedupe_begin(uint64_t estimated_groups, unsigned int batches)
 		return;
 
 	tty = true;
-	printf("\33[?25l");	/* hide the cursor */
-	prepare_screen_area();
+	printf("\33[?25l");	/* hide the cursor (a no-op if scan already did) */
+	/*
+	 * Do NOT reset drawn_lines here: the scan left its block in place (see
+	 * pscan_join with continues=true), so the first dedupe render redraws
+	 * over that same block, keeping the worker list continuous. When there
+	 * was no scan block (drawn_lines already 0) this simply draws fresh.
+	 */
 	pdd.running = 1;
 	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
 }

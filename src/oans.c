@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <string.h>
 #include <getopt.h>
+#include <stdarg.h>
 #include <inttypes.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -67,6 +68,27 @@ static int opt_no_color = 0;
 static char **user_excludes;
 static int n_user_excludes;
 struct dbfile_config dbfile_cfg;
+
+/*
+ * A status message emitted between the scan and dedupe phases. When the live
+ * worker block is on screen (interactive dedupe) it must be routed through
+ * pscan_printf() so it lands above the block instead of corrupting the
+ * relative redraw; otherwise it is a plain (quiet-respecting) print.
+ */
+static void gap_status(const char *fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	if (pscan_live_block())
+		pscan_printf("%s", buf);
+	else if (!quiet)
+		fputs(buf, stdout);
+}
 
 static void print_file(char *filename, char *ino, char *subvol)
 {
@@ -1056,10 +1078,13 @@ static void process_duplicates(struct dbhandle *db)
 	if (options.run_dedupe) {
 		unsigned long long total;
 
-		if (!quiet && isatty(STDOUT_FILENO)) {
-			printf("  %sAnalyzing duplicates...%s\r", col_dim, col_reset);
-			fflush(stdout);
-		}
+		/*
+		 * Counting the dup groups can take a moment on a big hashfile and
+		 * happens before the dedupe block starts drawing, so announce it
+		 * (routed above the scan block when it is still on screen).
+		 */
+		if (!quiet && isatty(STDOUT_FILENO))
+			gap_status("Analyzing duplicates…\n");
 		total = dbfile_count_dupe_groups(db, options.only_whole_files);
 		pdedupe_begin(total, passes);
 	}
@@ -1182,8 +1207,18 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 
 	pscan_finish_listing();
 	filescan_free();
-	if (!quiet)
-		pscan_join();
+	if (!quiet) {
+		/*
+		 * A live dedupe phase (the only one that keeps drawing the block)
+		 * runs when deduping on an interactive, non-verbose tty. Tell the
+		 * scan to leave its worker block in place for it; otherwise the
+		 * area is wiped clean.
+		 */
+		bool dedupe_live = options.run_dedupe && !verbose &&
+				   isatty(STDOUT_FILENO);
+
+		pscan_join(dedupe_live);
+	}
 
 	/*
 	 * Latch the per-run file count here, while the scan owns the progress
@@ -1502,13 +1537,13 @@ int main(int argc, char **argv)
 		int64_t pruned = filescan_prune_deleted(db);
 
 		if (pruned > 0)
-			qprintf("Pruned %lld deleted file%s from the "
+			gap_status("Pruned %lld deleted file%s from the "
 				"hashfile\n", (long long)pruned,
 				pruned == 1 ? "" : "s");
 	}
 
 	if (options.hashfile)
-		qprintf("Hashfile \"%s\" written\n", options.hashfile);
+		gap_status("Hashfile \"%s\" written\n", options.hashfile);
 
 	process_duplicates(db);
 
