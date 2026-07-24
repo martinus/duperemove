@@ -867,29 +867,29 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 	unsigned int nr = 0, i;
 	GError *err = NULL;
 
+	sorted = malloc((size_t)res->num_dupes * sizeof(*sorted));
+	abort_on(!sorted);	/* OOM: the whole program is out of memory */
+
+	/*
+	 * One walk: hold a ref on every filerec the tree references (all dexts -
+	 * free_results_tree frees them all at reap), and collect the >=2-member
+	 * groups to sort and push.
+	 */
 	for (node = rb_first(&res->root); node; node = rb_next(node)) {
 		dext = rb_entry(node, struct dupe_extents, de_node);
+
 		list_for_each_entry(extent, &dext->de_extents, e_list) {
 			filerec_get(extent->e_file);
 			g_ptr_array_add(batch->held, extent->e_file);
 		}
-	}
-
-	sorted = malloc((size_t)res->num_dupes * sizeof(*sorted));
-	if (!sorted)
-		abort_on(1);	/* OOM: the whole program is out of memory */
-
-	for (node = rb_first(&res->root); node; node = rb_next(node)) {
-		dext = rb_entry(node, struct dupe_extents, de_node);
 
 		if (dext->de_num_dupes < 2) {
 			qprintf("Skipping extent - insufficient duplicates (%u)\n",
 				   dext->de_num_dupes);
 			continue;
 		}
-		if (nr >= res->num_dupes)	/* should not happen */
-			break;
-		sorted[nr++] = dext;
+		if (nr < res->num_dupes)	/* nr > num_dupes can't happen */
+			sorted[nr++] = dext;
 	}
 
 	qsort(sorted, nr, sizeof(*sorted), cmp_dext_work);
@@ -936,13 +936,11 @@ struct dedupe_batch *dedupe_begin_batch(unsigned int seq_hi)
 {
 	struct dedupe_batch *b = calloc(1, sizeof(*b));
 
-	abort_on(!b);	/* OOM */
+	abort_on(!b);	/* OOM; calloc zeroed outstanding/fully_pushed */
 	init_results_tree(&b->res_files);
 	init_results_tree(&b->res_extents);
 	b->held = g_ptr_array_new();
 	b->seq_hi = seq_hi;
-	b->outstanding = 0;
-	b->fully_pushed = false;
 	INIT_LIST_HEAD(&b->list);
 	return b;
 }
