@@ -42,7 +42,7 @@ Summary
 
 | Feature | What you get |
 |---|---|
-| ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* already shared — rescanning a deduped 2M-file / 230 GiB tree takes **~92 s vs ~11 min for duperemove 0.15.2** (~7×). And when the tree is **larger than RAM** (the usual NAS/backup case), even a first-run dedupe is **~11× faster** (14 s vs 155 s): oans prefetches the data the kernel re-reads cold — [benchmark](docs/benchmarks-low-memory.md). |
+| ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* already shared — rescanning a deduped 2M-file / 230 GiB tree takes **~92 s vs ~11 min for duperemove 0.15.2** (~7×). And when the tree is **larger than RAM** (the usual NAS/backup case), even a first-run dedupe is **~13× faster** (14 s vs 180 s): oans prefetches the data the kernel re-reads cold — [benchmark](docs/benchmarks.md#larger-than-ram-dedupe). |
 | 🪄 **Zero-config re-runs** | The hashfile remembers your options, paths and excludes. After the first run, `oans --hashfile=FILE` — nothing else — replays it incrementally. |
 | ⏰ **Scheduling built in** | `sudo make install-systemd`, then `systemctl enable --now oans@data.timer`. Weekly dedupe at idle I/O priority, no cron scripts. |
 | 📊 **Observability** | `--stats` shows what a hashfile holds and how much is duplicated; `--history` shows space actually reclaimed over time; `--json` exports metrics for dashboards; `--progress=json` streams live per-phase progress for monitoring scheduled runs. |
@@ -194,8 +194,8 @@ and comparison binary are documented in the
   (halves kernel dedupe traffic, fixes accounting).
 - **Fast dedupe on trees larger than RAM:** keep just-hashed data in the page
   cache for the dedupe phase and prefetch each `FIDEDUPERANGE` round, so the
-  kernel byte-compares from RAM instead of a slow cold re-read — **~11× faster**
-  than upstream under memory pressure ([benchmark](docs/benchmarks-low-memory.md)).
+  kernel byte-compares from RAM instead of a slow cold re-read — **~13× faster**
+  than upstream under memory pressure ([benchmark](docs/benchmarks.md#larger-than-ram-dedupe)).
 - **Batched SQLite transactions** (~10 s cadence) for both the change-detection
   reads and writes — hundreds of thousands of per-file lock syscalls collapse to
   a few hundred (~24 % faster rescans).
@@ -271,14 +271,14 @@ Full reference — every option, FAQ, examples: **[oans man page](docs/man/oans.
 
 > [!NOTE]
 > **On a dataset larger than RAM** — the normal case for a NAS / backup / build
-> tree — oans deduplicates **~11× faster than upstream duperemove** (median
-> **14 s vs 155 s** on an ~11 GiB tree with the page cache capped to 4 GiB),
-> hashes ~1.6× faster, uses less than half the peak RSS, and writes a ~1.8×
-> smaller hashfile — doing byte-for-byte identical dedupe. This is where the
-> dedupe-phase design pays off: when the working set doesn't fit in cache, the
-> kernel's `FIDEDUPERANGE` re-read is slow cold, and oans prefetches it while
-> upstream doesn't. Full methodology, parameters and per-round tables:
-> **[larger-than-RAM benchmark](docs/benchmarks-low-memory.md)**.
+> tree — oans deduplicates **~13× faster than upstream duperemove** (median
+> **13.8 s vs 179.7 s** on an ~10.5 GiB tree with the page cache capped to 4 GiB),
+> uses roughly half the peak RSS, and writes a ~1.8× smaller hashfile — doing
+> byte-for-byte identical dedupe. This is where the dedupe-phase design pays off:
+> when the working set doesn't fit in cache, the kernel's `FIDEDUPERANGE` re-read
+> is slow cold, and oans prefetches it while upstream doesn't. Full methodology,
+> parameters and per-round tables:
+> **[larger-than-RAM benchmark](docs/benchmarks.md#larger-than-ram-dedupe)**.
 
 ## How it compares
 
@@ -296,7 +296,7 @@ want, on the btrfs/XFS you already have.
 
 **vs. upstream duperemove:** the same engine, tuned for *re-running regularly*
 and for trees **larger than RAM** — where its dedupe phase measures
-[~11× faster](docs/benchmarks-low-memory.md). See
+[~13× faster](docs/benchmarks.md#larger-than-ram-dedupe). See
 [What the fork changes](#what-the-fork-changes) above, and the
 attribution below.
 
@@ -328,7 +328,7 @@ Differences to know about:
 
 - 🚀 [NAS quick-start](docs/nas-quickstart.md) — scheduled dedupe on a NAS/server, step by step
 - 📖 [Man page](docs/man/oans.md) — full option reference, FAQ, examples
-- 📊 [Benchmark methodology](docs/benchmarks.md) and [larger-than-RAM benchmark](docs/benchmarks-low-memory.md) — how the numbers were measured
+- 📊 [Benchmarks](docs/benchmarks.md) — warm re-runs and the larger-than-RAM dedupe, and how the numbers were measured
 - ⏰ [systemd templates](systemd/README.md) — the `oans@` service/timer units
 - 🧪 [Test suite](tests/) — Python integration tests (stdlib-only) run by [CI](.github/workflows/ci.yml)
 - ⬆️ [Upstream duperemove](https://github.com/markfasheh/duperemove) and its [wiki](https://github.com/markfasheh/duperemove/wiki)
