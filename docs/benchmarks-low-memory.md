@@ -87,7 +87,8 @@ the cold in-kernel read path for the evicted data.
 | **CPU** | AMD Ryzen 9 7950X (16 cores / 32 threads) |
 | **RAM** | 62 GiB |
 | **Storage** | Corsair MP400 NVMe, **btrfs** |
-| **Kernel** | 7.1.3 (cgroup v2) |
+| **OS** | Fedora Linux 44 |
+| **Kernel** | 7.1.3-200.fc44.x86_64 (cgroup v2) |
 | **Dataset** | two non-reflinked copies of a Linux kernel git tree: **189,546 files, ~11 GiB**, fully duplicated (copy2 == copy1) |
 | **Memory cap** | **4 GiB** per run, via `systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0` |
 | **Rounds** | 10 per configuration |
