@@ -1084,10 +1084,16 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
  * order so the watermark lands on the last completed generation), tear down the
  * pool, then print one aggregated summary spanning the whole phase.
  */
-void dedupe_phase_end(void)
+/*
+ * Wait until every sealed batch has completed and been reaped (producer
+ * thread). Needed by the block-hash search (--dedupe-options=partial):
+ * find_additional_dedupe() walks the GLOBAL filerec list, so earlier batches'
+ * filerecs must be reaped first or the search would rescan the previous
+ * window's files. Everywhere else the pipeline overlap is the whole point -
+ * don't add drain points.
+ */
+void dedupe_drain(void)
 {
-	uint64_t groups, reclaimed, net_shared;
-
 	g_mutex_lock(&producer_mutex);
 	while (inflight_count > 0) {
 		reap_ready_locked();
@@ -1095,6 +1101,13 @@ void dedupe_phase_end(void)
 			g_cond_wait(&producer_cond, &producer_mutex);
 	}
 	g_mutex_unlock(&producer_mutex);
+}
+
+void dedupe_phase_end(void)
+{
+	uint64_t groups, reclaimed, net_shared;
+
+	dedupe_drain();
 
 	if (dedupe_pool) {
 		g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for exit */
