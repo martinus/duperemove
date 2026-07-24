@@ -23,8 +23,10 @@
 #include "rbtree.h"
 #include "results-tree.h"
 
-SLIST_HEAD(filerec_list, filerec);
-extern struct filerec_list filerec_head;
+/* Doubly-linked (kernel list_head) so an individual filerec can be removed in
+ * O(1): the streaming dedupe phase frees filerecs per batch, in load order, not
+ * head-first, so a singly-linked list's O(n) removal made teardown O(n^2). */
+extern struct list_head filerec_head;
 
 extern unsigned long long num_filerecs;
 extern unsigned int dedupe_seq; /* This is incremented on every dedupe pass */
@@ -32,6 +34,14 @@ extern unsigned int dedupe_seq; /* This is incremented on every dedupe pass */
 struct filerec {
 	int		fd;			/* file descriptor */
 	unsigned int	fd_refs;			/* fd refcount */
+	/*
+	 * Lifetime refcount, distinct from fd_refs. In the streaming dedupe
+	 * phase a filerec can be referenced by more than one in-flight batch
+	 * (e.g. a cross-window anchor); each batch that loads it holds one ref
+	 * and drops it at batch completion. All get/put happen on the single
+	 * producer thread, so this needs no lock. filerec_new() starts at 0.
+	 */
+	unsigned int	refs;
 
 	char	*filename;		/* path to file */
 	int64_t fileid;
@@ -41,7 +51,7 @@ struct filerec {
 	uint64_t		size;
 	struct rb_root		block_tree;	/* root for hash blocks tree */
 
-	SLIST_ENTRY(filerec)	rec_list;	/* all filerecs */
+	struct list_head	rec_list;	/* all filerecs */
 };
 
 void init_filerec(void);
@@ -50,6 +60,13 @@ void free_all_filerecs(void);
 struct filerec *filerec_new(const char *filename, int64_t fileid,
 			    uint64_t size);
 struct filerec *filerec_find(int64_t fileid);
+
+/*
+ * Lifetime refcount (see struct filerec::refs). filerec_put() frees the filerec
+ * when its count reaches zero. Producer-thread only; not thread-safe by design.
+ */
+void filerec_get(struct filerec *file);
+void filerec_put(struct filerec *file);
 
 int filerec_open(struct filerec *file, bool quiet);
 void filerec_close(struct filerec *file);
