@@ -631,6 +631,23 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 	}											\
 } while (0)
 
+/*
+ * The set of files that are members of a whole-file dup group (scanned, same
+ * digest+size, >1 member) - the same membership GET_DUPLICATE_FILES tests.
+ * Whole-file dedupe remaps/removes their extents, so both the extent loader
+ * (GET_DUPLICATE_EXTENTS) and the pending-work byte count
+ * (dbfile_count_dupe_bytes) must exclude them. Defined once so the loader and
+ * the progress total can't silently drift. Compose as: "with " FILEDUP_CTE ...
+ */
+#define FILEDUP_CTE							\
+"filedup(id) as ( "							\
+"	select id from files "						\
+"	where digest is not null and not (flags & 1) "			\
+"	and (digest, size) in ( "					\
+"		select digest, size from files "			\
+"		where digest is not null and not (flags & 1) "		\
+"		group by digest, size having count(*) > 1)) "
+
 static struct dbhandle *open_handle(char *filename, bool readonly)
 {
 	struct dbhandle *result = calloc(1, sizeof(struct dbhandle));
@@ -720,13 +737,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * pipeline. `filedup` mirrors GET_DUPLICATE_FILES' membership test.
  */
 #define GET_DUPLICATE_EXTENTS						\
-"with filedup(id) as ( "						\
-"	select id from files "						\
-"	where digest is not null and not (flags & 1) "			\
-"	and (digest, size) in ( "					\
-"		select digest, size from files "			\
-"		where digest is not null and not (flags & 1) "		\
-"		group by digest, size having count(*) > 1)), "		\
+"with " FILEDUP_CTE ", "						\
 "grp(digest, len) as ( "						\
 "	select extents.digest, len from extents "			\
 "	join files on fileid = id "					\
@@ -2215,13 +2226,7 @@ uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
 	 * be max()-fudged.
 	 */
 	extents = dbfile_query_u64_arg(db->db,
-		"with filedup(id) as ( "
-		"  select id from files "
-		"  where digest is not null and not (flags & 1) "
-		"    and (digest, size) in ( "
-		"      select digest, size from files "
-		"      where digest is not null and not (flags & 1) "
-		"      group by digest, size having count(*) > 1)) "
+		"with " FILEDUP_CTE
 		"select coalesce(sum(len * (case when old_cnt > 0 then new_cnt "
 		"                                else new_cnt - 1 end)), 0) "
 		"from ( "
