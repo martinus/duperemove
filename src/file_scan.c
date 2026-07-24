@@ -1019,10 +1019,22 @@ static void process_dir(const char *path, struct dbhandle *db)
 		    !(options.recurse_dirs && entry->d_type == DT_DIR))
 			continue;
 
-		if (dirlen + strlen(entry->d_name) > PATH_MAX)
-			continue;
+		/*
+		 * PATH_MAX bounds the path any syscall (statx/open/dedupe ioctl)
+		 * will accept, so we cannot hash a file we can only name with a
+		 * longer absolute path. Warn instead of silently ignoring it; the
+		 * child buffer is oversized (PATH_MAX + 257) so we can still form
+		 * the full name for the message. See issue #108.
+		 */
+		size_t namelen = strlen(entry->d_name);
 
 		strcpy(child + dirlen, entry->d_name);
+
+		if (dirlen + namelen > PATH_MAX) {
+			eprintf("Skipping \"%s\": absolute path length %zu exceeds PATH_MAX (%d)\n",
+				child, dirlen + namelen, PATH_MAX);
+			continue;
+		}
 
 		if (statx(0, child, 0, STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS)) {
