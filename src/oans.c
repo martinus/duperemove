@@ -1048,10 +1048,16 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 			      struct dedupe_batch *batch,
 			      unsigned int seq_lo, unsigned int seq_hi)
 {
+	int ret;
+
 	pdedupe_set_activity("loading identical files");
 	load_lock(inmem);
-	dbfile_load_same_files(pdb, dedupe_batch_files(batch), seq_lo, seq_hi);
+	ret = dbfile_load_same_files(pdb, dedupe_batch_files(batch),
+				     seq_lo, seq_hi);
 	load_unlock(inmem);
+	if (ret)
+		eprintf("Error loading whole-file duplicates for generations "
+			"(%u, %u]; deduping what was loaded\n", seq_lo, seq_hi);
 	dedupe_push(batch, true);
 
 	if (options.only_whole_files)
@@ -1059,18 +1065,35 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 
 	pdedupe_set_activity("loading duplicate extents");
 	load_lock(inmem);
-	dbfile_load_extent_hashes(pdb, dedupe_batch_extents(batch),
-				  seq_lo, seq_hi);
+	ret = dbfile_load_extent_hashes(pdb, dedupe_batch_extents(batch),
+					seq_lo, seq_hi);
 	load_unlock(inmem);
+	if (ret)
+		eprintf("Error loading duplicate extents for generations "
+			"(%u, %u]; deduping what was loaded\n", seq_lo, seq_hi);
 
 	if (options.do_block_hash) {
 		struct hash_tree dups_tree;
 
+		/*
+		 * The block-hash search walks the GLOBAL filerec list, so the
+		 * previous window's batches must be reaped (their filerecs
+		 * freed) first or it would rescan those files. This gives up
+		 * cross-batch pipelining in partial mode; the default mode
+		 * keeps the full overlap.
+		 */
+		dedupe_drain();
+
 		init_hash_tree(&dups_tree);
 		load_lock(inmem);
-		dbfile_load_block_hashes(pdb, &dups_tree, seq_lo, seq_hi);
+		ret = dbfile_load_block_hashes(pdb, &dups_tree, seq_lo, seq_hi);
 		load_unlock(inmem);
-		find_additional_dedupe(dedupe_batch_extents(batch));
+		if (ret)
+			eprintf("Error loading block hashes for generations "
+				"(%u, %u]; partial dedupe may be incomplete\n",
+				seq_lo, seq_hi);
+		else
+			find_additional_dedupe(dedupe_batch_extents(batch));
 		free_hash_tree(&dups_tree);
 	}
 	dedupe_push(batch, false);

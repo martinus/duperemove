@@ -32,6 +32,9 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi));
 void dedupe_phase_end(void);
 
 void dedupe_await_slot(void);
+/* Wait for every sealed batch to complete + reap. Only for the block-hash
+ * search, which walks the global filerec list; see run_dedupe.c. */
+void dedupe_drain(void);
 struct dedupe_batch *dedupe_begin_batch(unsigned int seq_hi);
 struct results_tree *dedupe_batch_files(struct dedupe_batch *b);
 struct results_tree *dedupe_batch_extents(struct dedupe_batch *b);

@@ -103,6 +103,38 @@ class StreamingDedupeTest(DuperemoveTest):
         if BTRFS:
             self.assertShared(ext[0], ext[1], "extent tail deduped")
 
+    def test_partial_mode_streams(self):
+        # --dedupe-options=partial: the block-hash search walks the GLOBAL
+        # filerec list, so the producer drains prior batches before running it
+        # (partial mode gives up cross-batch pipelining). Many small windows
+        # exercise that drain path; everything must still converge and a rerun
+        # must be a no-op.
+        pairs = []
+        for i in range(24):
+            d = os.urandom(200000 + i)
+            a = self.write(f"tree/a{i:02d}", d)
+            b = self.write(f"tree/b{i:02d}", d)
+            pairs.append((a, b))
+        self.sync()
+
+        opts = ("-rd", "--dedupe-options=partial", *self.BOPT)
+        self.dm(*opts, self.path("tree"), env=self.ENV)
+        self.assertDmOk()
+        self.sync()
+
+        # partial was actually active: block hashes were stored
+        self.assertGreater(
+            self.hf_scalar("select count(*) from blocks"), 0,
+            "block hashes stored under --dedupe-options=partial")
+        for a, b in pairs:
+            self.assertTrue(files_share(a, b),
+                            f"{os.path.basename(a)} pair deduped")
+        self.assertEqual(self._config_seq(), self._max_file_seq())
+
+        self.dm(*opts, self.path("tree"), env=self.ENV)
+        self.assertDmOk()
+        self.assertNoNewSharing()
+
     def test_in_memory_dedupe_streams(self):
         # No --hashfile: the producer shares the in-memory handle and serializes
         # loads with the write lock. Dedupe must still happen on disk.

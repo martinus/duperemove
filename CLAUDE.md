@@ -338,13 +338,31 @@ extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
   in-memory shared-cache db (no `--hashfile`) has no WAL, so there the producer
   reuses the global handle and serializes loads with `dbfile_lock()` (`inmem`).
 - **Order-independence (Stage 2.1).** `GET_DUPLICATE_EXTENTS` excludes whole-file
-  dup members *statically* (the `filedup` CTE) instead of relying on the
-  whole-file pass having deleted their extent rows first — the prerequisite for
-  loading both passes without a barrier. As a bonus the two per-batch results
+  dup members *statically* (the `FILEDUP_MEMBER` predicate) instead of relying on
+  the whole-file pass having deleted their extent rows first — the prerequisite
+  for loading both passes without a barrier. As a bonus the two per-batch results
   trees reference **disjoint** filerec sets. Pinned by
   `test_extent_order_independent.py`; streaming by `test_streaming_dedupe.py`.
+  **Keep it a correlated probe, not a materialized set:** a `group by digest,
+  size` CTE here cost ~6 s per batch load on a 3.5M-file hashfile (the producer
+  stalls at "loading duplicate extents" while the pool idles; measured 21.7 s →
+  0.2 s per load after the switch).
+- **A pushed dext belongs to the worker.** The moment `g_thread_pool_push()`
+  hands a group to the pool, a worker can free it (an already-shared group is
+  cleaned in microseconds) — the producer must capture anything it needs
+  (`dext_work()` etc.) **before** the push. Reading after once fed
+  `len * (0 - 1)` from a freed dext into the pushed-work total (frozen bar,
+  multi-thousand-year ETA); `push_results` now asserts sane per-group work.
+- **Partial mode drains.** `find_additional_dedupe()` walks the **global**
+  filerec list, so with `--dedupe-options=partial` the producer calls
+  `dedupe_drain()` before the block-hash search — earlier batches are reaped
+  (filerecs freed) first, at the cost of cross-batch pipelining in that mode.
+  Default mode keeps the full overlap; don't add other drain points.
 - **Valgrind is the gate** (`make integration-valgrind`): this is the UAF-prone
-  area (see the "Valgrind" section / PR #105). Run it before any PR here.
+  area (see the "Valgrind" section / PR #105). Run it before any PR here — but
+  note it did **not** catch the pushed-dext race above (valgrind's serialization
+  makes a fast worker win too rarely); producer-vs-worker lifetime rules need
+  review, not just the suite.
 
 ## Dedupe progress is byte-weighted (not group-counted)
 
