@@ -1034,39 +1034,42 @@ static void dedupe_advance_seq(unsigned int seq_hi)
 	dbfile_unlock();
 }
 
+/*
+ * The in-memory shared-cache db (no WAL) shares its handle with the dedupe
+ * workers, so the producer must serialize its loads against worker writes with
+ * dbfile_lock(); the hashfile path loads on a separate WAL read connection that
+ * doesn't block the writer, so there these are no-ops.
+ */
+static void load_lock(bool inmem)   { if (inmem) dbfile_lock(); }
+static void load_unlock(bool inmem) { if (inmem) dbfile_unlock(); }
+
 /* Load one generation window's groups into a batch and submit them. */
 static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 			      struct dedupe_batch *batch,
 			      unsigned int seq_lo, unsigned int seq_hi)
 {
 	pdedupe_set_activity("loading identical files");
-	if (inmem)
-		dbfile_lock();
+	load_lock(inmem);
 	dbfile_load_same_files(pdb, dedupe_batch_files(batch), seq_lo, seq_hi);
-	if (inmem)
-		dbfile_unlock();
+	load_unlock(inmem);
 	dedupe_push(batch, true);
 
 	if (options.only_whole_files)
 		return;
 
 	pdedupe_set_activity("loading duplicate extents");
-	if (inmem)
-		dbfile_lock();
+	load_lock(inmem);
 	dbfile_load_extent_hashes(pdb, dedupe_batch_extents(batch),
 				  seq_lo, seq_hi);
-	if (inmem)
-		dbfile_unlock();
+	load_unlock(inmem);
 
 	if (options.do_block_hash) {
 		struct hash_tree dups_tree;
 
 		init_hash_tree(&dups_tree);
-		if (inmem)
-			dbfile_lock();
+		load_lock(inmem);
 		dbfile_load_block_hashes(pdb, &dups_tree, seq_lo, seq_hi);
-		if (inmem)
-			dbfile_unlock();
+		load_unlock(inmem);
 		find_additional_dedupe(dedupe_batch_extents(batch));
 		free_hash_tree(&dups_tree);
 	}
